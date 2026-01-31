@@ -16,6 +16,8 @@ def load_data(path="influencer_roi_dummy.csv"):
 
 df = load_data()
 
+st.set_page_config(page_title="Influencer ROI Analytics", layout="wide")
+
 st.title("Influencer ROI Analytics")
 
 # --------- DATA SOURCE (SIDEBAR) ---------
@@ -28,7 +30,7 @@ if source == "Upload my campaign CSV":
     uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
     if uploaded is not None:
         df_user = pd.read_csv(uploaded)
-        st.success(f"Loaded {len[df_user]} rows from your file.")
+        st.success(f"Loaded {len(df_user)} rows from your file.")
         df = df_user
 
 if "engagement_rate_est" not in df.columns and {
@@ -41,8 +43,55 @@ if "engagement_rate_est" not in df.columns and {
         / df["followers_start"].replace(0, np.nan)
     )
 
-# --------- MODE SWITCH ON MAIN SCREEN ---------
-mode = st.radio("View", ["Dashboard", "Planner"], horizontal=True)
+# --------- STYLED TOGGLE BUTTONS (DASHBOARD / PLANNER) ---------
+st.markdown(
+    """
+    <style>
+    .mode-toggle {
+        display: inline-flex;
+        border-radius: 999px;
+        border: 1px solid #cccccc;
+        overflow: hidden;
+        margin-bottom: 1rem;
+    }
+    .mode-segment {
+        padding: 0.35rem 1.1rem;
+        cursor: pointer;
+        font-weight: 500;
+        font-size: 0.9rem;
+        border: none;
+        background: transparent;
+        color: #555555;
+    }
+    .mode-segment-selected {
+        background: #0f62fe;
+        color: white;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+mode_col = st.container()
+with mode_col:
+    cols = st.columns([1, 1])
+
+# Use a radio for state, but hide its default look and render custom pills
+mode = st.radio(
+    "View",
+    ["Dashboard", "Planner"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+# Render pill-style buttons reflecting current mode
+btn_html = f"""
+<div class="mode-toggle">
+  <div class="mode-segment {'mode-segment-selected' if mode=='Dashboard' else ''}">Dashboard</div>
+  <div class="mode-segment {'mode-segment-selected' if mode=='Planner' else ''}">Planner</div>
+</div>
+"""
+st.markdown(btn_html, unsafe_allow_html=True)
 
 # ============================================================
 #                         DASHBOARD
@@ -86,7 +135,11 @@ if mode == "Dashboard":
             .mark_bar()
             .encode(
                 x=alt.X("platform:N", title="Platform"),
-                y=alt.Y("avg_eng_rate:Q", title="Avg engagement rate", axis=alt.Axis(format="%")),
+                y=alt.Y(
+                    "avg_eng_rate:Q",
+                    title="Avg engagement rate",
+                    axis=alt.Axis(format="%"),
+                ),
                 tooltip=["platform", "avg_eng_rate", "campaigns"],
                 color="platform:N",
             )
