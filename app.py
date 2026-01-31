@@ -8,7 +8,6 @@ import altair as alt
 def load_data(path="influencer_roi_dummy.csv"):
     df = pd.read_csv(path)
     df["roas"] = df["roas"].clip(lower=0)
-    # basic derived metric for dashboard
     df["engagement_rate_est"] = (
         (df["avg_likes_per_post"] + df["avg_comments_per_post"])
         / df["followers_start"].replace(0, np.nan)
@@ -19,10 +18,7 @@ df = load_data()
 
 st.title("Influencer ROI Analytics")
 
-# --------- TOP-LEVEL MODE SWITCH ---------
-mode = st.sidebar.radio("Mode", ["Dashboard", "Planner"])
-
-# --------- SIDEBAR: DATA SOURCE ---------
+# --------- DATA SOURCE (SIDEBAR) ---------
 source = st.sidebar.radio(
     "Data source",
     ["Use sample dataset", "Upload my campaign CSV"],
@@ -32,11 +28,9 @@ if source == "Upload my campaign CSV":
     uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
     if uploaded is not None:
         df_user = pd.read_csv(uploaded)
-        st.success(f"Loaded {len(df_user)} rows from your file.")
-        # Expect same column names; otherwise add mapping/validation
+        st.success(f"Loaded {len[df_user]} rows from your file.")
         df = df_user
 
-# Recompute engagement_rate_est if user dataset loaded
 if "engagement_rate_est" not in df.columns and {
     "avg_likes_per_post",
     "avg_comments_per_post",
@@ -47,13 +41,15 @@ if "engagement_rate_est" not in df.columns and {
         / df["followers_start"].replace(0, np.nan)
     )
 
+# --------- MODE SWITCH ON MAIN SCREEN ---------
+mode = st.radio("View", ["Dashboard", "Planner"], horizontal=True)
+
 # ============================================================
 #                         DASHBOARD
 # ============================================================
 if mode == "Dashboard":
     st.subheader("Overview dashboard")
 
-    # Basic KPIs
     total_campaigns = len(df)
     unique_influencers = df["influencer_id"].nunique()
     unique_brands = df["brand_name"].nunique() if "brand_name" in df.columns else np.nan
@@ -72,7 +68,6 @@ if mode == "Dashboard":
     kpi4.metric("Average ROAS", f"{avg_roas:.2f}x")
     kpi5.metric("Avg est. engagement rate", f"{avg_eng_rate*100:.2f}%")
 
-    # 1) Highest engagement rate by platform
     st.markdown("### Engagement and ROAS by platform")
 
     if "platform" in df.columns:
@@ -86,7 +81,6 @@ if mode == "Dashboard":
             .reset_index()
         )
 
-        # Bar: average engagement rate by platform
         eng_chart = (
             alt.Chart(plat_group)
             .mark_bar()
@@ -98,7 +92,6 @@ if mode == "Dashboard":
             )
         )
 
-        # Bar: average ROAS by platform
         roas_chart = (
             alt.Chart(plat_group)
             .mark_bar()
@@ -118,7 +111,6 @@ if mode == "Dashboard":
     else:
         st.info("Platform column not found in data; cannot show platform breakdown.")
 
-    # 2) Top influencers by ROAS and by engagement
     st.markdown("### Top performers (per influencer)")
 
     if {"influencer_id", "influencer_handle"}.issubset(df.columns):
@@ -140,46 +132,38 @@ if mode == "Dashboard":
             st.write("Top 10 influencers by average ROAS")
             st.dataframe(
                 top_roas[
-                    [
-                        "influencer_handle",
-                        "influencer_tier",
-                        "mean_roas",
-                        "campaigns",
-                    ]
-                ].rename(
+                    ["influencer_handle", "influencer_tier", "mean_roas", "campaigns"]
+                ]
+                .rename(
                     columns={
                         "influencer_handle": "Influencer",
                         "influencer_tier": "Tier",
                         "mean_roas": "Mean ROAS",
                         "campaigns": "Campaigns",
                     }
-                ).style.format({"Mean ROAS": "{:.2f}"})
+                )
+                .style.format({"Mean ROAS": "{:.2f}"})
             )
         with c4:
             st.write("Top 10 influencers by average engagement rate")
             st.dataframe(
                 top_eng[
-                    [
-                        "influencer_handle",
-                        "influencer_tier",
-                        "mean_eng_rate",
-                        "campaigns",
-                    ]
-                ].rename(
+                    ["influencer_handle", "influencer_tier", "mean_eng_rate", "campaigns"]
+                ]
+                .rename(
                     columns={
                         "influencer_handle": "Influencer",
                         "influencer_tier": "Tier",
                         "mean_eng_rate": "Mean engagement rate",
                         "campaigns": "Campaigns",
                     }
-                ).style.format({"Mean engagement rate": "{:.2%}"})
+                )
+                .style.format({"Mean engagement rate": "{:.2%}"})
             )
     else:
         st.info("Influencer columns not found; cannot show top performers.")
 
-    # 3) ROAS distribution
     st.markdown("### ROAS distribution")
-
     roas_clean = df["roas"].replace([np.inf, -np.inf], np.nan).dropna()
     if len(roas_clean) > 0:
         roas_df = pd.DataFrame({"roas": roas_clean})
@@ -194,11 +178,6 @@ if mode == "Dashboard":
         st.altair_chart(roas_chart, use_container_width=True)
     else:
         st.info("No valid ROAS values to plot.")
-
-    st.caption(
-        "Dashboard shows high-level trends only. Use the Planner tab to simulate specific budgets "
-        "and see recommended influencer allocations."
-    )
 
 # ============================================================
 #                         PLANNER
@@ -226,7 +205,6 @@ else:
         st.warning("No data for this combination. Try another category/platform.")
         st.stop()
 
-    # Influencer summary for planner
     inf_summary = (
         filtered.groupby(["influencer_id", "influencer_handle", "influencer_tier"])
         .agg(
@@ -346,8 +324,3 @@ else:
     )
 
     st.altair_chart(chart, use_container_width=True)
-
-    st.caption(
-        "Planner uses mean ROAS per influencer from historical-like data. "
-        "You can later plug in a trained model here for more accurate predictions."
-    )
