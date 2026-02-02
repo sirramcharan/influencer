@@ -9,9 +9,9 @@ import altair as alt
 
 def spend_to_revenue(spend_array, k, alpha, beta):
     """
-    Vectorized non-linear response curve for influencer revenue.
-    revenue = k * (scaled_spend^alpha) * exp(-beta * scaled_spend), scaled_spend = spend / 1e6.
-    Returns revenue in same currency units as spend (e.g., INR).
+    Non-linear response curve for influencer revenue.
+    revenue = k * (scaled_spend^alpha) * exp(-beta * scaled_spend),
+    scaled_spend = spend / 1e6.
     """
     spend_array = np.array(spend_array, dtype=float)
     spend_scaled = spend_array / 1_000_000.0
@@ -28,7 +28,6 @@ def spend_to_revenue(spend_array, k, alpha, beta):
 def load_data(path="influencer_roi_dummy.csv"):
     df = pd.read_csv(path)
     df["roas"] = df["roas"].clip(lower=0)
-    # engagement rate estimate for dashboard
     if {
         "avg_likes_per_post",
         "avg_comments_per_post",
@@ -43,9 +42,9 @@ def load_data(path="influencer_roi_dummy.csv"):
     return df
 
 
+st.set_page_config(page_title="Influencer ROI Analytics", layout="wide")
 df = load_data()
 
-st.set_page_config(page_title="Influencer ROI Analytics", layout="wide")
 st.title("Influencer ROI Analytics")
 
 # ============================================================
@@ -75,46 +74,14 @@ if "engagement_rate_est" not in df.columns and {
     )
 
 # ============================================================
-#                 PILL-STYLE TOGGLE (DASHBOARD / PLANNER)
+#                 MODE TOGGLE (DASHBOARD / PLANNER)
 # ============================================================
 
-st.markdown(
-    """
-    <style>
-    .mode-toggle {
-        display: inline-flex;
-        border-radius: 999px;
-        border: 1px solid #cccccc;
-        overflow: hidden;
-        margin-bottom: 1rem;
-    }
-    .mode-segment {
-        padding: 0.35rem 1.1rem;
-        cursor: pointer;
-        font-weight: 500;
-        font-size: 0.9rem;
-        border: none;
-        background: transparent;
-        color: #555555;
-    }
-    .mode-segment-selected {
-        background: #0f62fe;
-        color: white;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
+mode = st.segmented_control(
+    "View",
+    options=["Dashboard", "Planner"],
+    default="Dashboard",
 )
-
-mode = st.radio("View", ["Dashboard", "Planner"], horizontal=True, label_visibility="collapsed")
-
-btn_html = f"""
-<div class="mode-toggle">
-  <div class="mode-segment {'mode-segment-selected' if mode=='Dashboard' else ''}">Dashboard</div>
-  <div class="mode-segment {'mode-segment-selected' if mode=='Planner' else ''}">Planner</div>
-</div>
-"""
-st.markdown(btn_html, unsafe_allow_html=True)
 
 # ============================================================
 #                         DASHBOARD
@@ -298,7 +265,7 @@ else:
         .reset_index()
     )
 
-    # Bring curve parameters k, alpha, beta from campaigns
+    # Bring curve parameters from campaigns
     if {"curve_k", "curve_alpha", "curve_beta"}.issubset(filtered.columns):
         curve_params = (
             filtered.groupby("influencer_id")
@@ -321,7 +288,7 @@ else:
         inf_summary["mean_cpa"].replace([np.inf, -np.inf], np.nan).fillna(0)
     )
 
-    # Budget inputs: number input for actual budget, slider only for graph
+    # Budget inputs: numeric for real budget, slider for graph range
     min_budget = max(10_000, int(filtered["total_spend"].quantile(0.1)))
     max_budget_default = int(filtered["total_spend"].quantile(0.9) * 5)
 
@@ -348,7 +315,6 @@ else:
 
     top_n = st.slider("Max number of influencers in combo", 1, 5, 3)
 
-    # Expected revenue for each influencer at this budget using curve
     def expected_rev_for_row(row, spend):
         return float(spend_to_revenue(spend, row["k"], row["alpha"], row["beta"]))
 
@@ -356,12 +322,9 @@ else:
         lambda r: expected_rev_for_row(r, budget), axis=1
     )
     inf_summary["expected_roas_at_budget"] = (
-        inf_summary["expected_revenue_at_budget"] / budget
-        if budget > 0
-        else 0.0
+        inf_summary["expected_revenue_at_budget"] / budget if budget > 0 else 0.0
     )
 
-    # Rank by expected revenue at this budget
     ranked = inf_summary.sort_values(
         "expected_revenue_at_budget", ascending=False
     ).reset_index(drop=True)
@@ -369,7 +332,6 @@ else:
     best_single = ranked.iloc[0]
     single_rev = best_single["expected_revenue_at_budget"]
 
-    # Best combo of top_n influencers (equal split)
     combo = ranked.head(top_n).copy()
     combo["allocated_budget"] = budget / top_n
     combo["expected_revenue"] = combo.apply(
@@ -428,7 +390,7 @@ else:
     single_curve = spend_to_revenue(
         budgets, best_single["k"], best_single["alpha"], best_single["beta"]
     )
-    combo_curve = budgets * combo_roas  # simple approximation for combo
+    combo_curve = budgets * combo_roas  # approximation for combo
 
     plot_df = pd.DataFrame(
         {
