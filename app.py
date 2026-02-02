@@ -25,7 +25,7 @@ def spend_to_revenue(spend_array, k, alpha, beta):
 # ============================================================
 
 @st.cache_data
-def load_data(path="influencer_roi_dummy.csv"):
+def load_data(path="influencer_roi.csv"):
     df = pd.read_csv(path)
     df["roas"] = df["roas"].clip(lower=0)
     if {
