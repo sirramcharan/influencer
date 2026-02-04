@@ -25,7 +25,7 @@ def spend_to_revenue(spend_array, k, alpha, beta):
 # ============================================================
 
 @st.cache_data
-def load_data(path="influencer_roi.csv"):
+def load_data(path="influencer_roi_dummy.csv"):
     df = pd.read_csv(path)
     df["roas"] = df["roas"].clip(lower=0)
     if {
@@ -253,7 +253,7 @@ else:
         st.warning("No data for this combination. Try another category/platform.")
         st.stop()
 
-    # Influencer summary from filtered campaigns
+    # Influencer summary
     inf_summary = (
         filtered.groupby(["influencer_id", "influencer_handle", "influencer_tier"])
         .agg(
@@ -265,7 +265,7 @@ else:
         .reset_index()
     )
 
-    # Bring curve parameters from campaigns
+    # Curve parameters
     if {"curve_k", "curve_alpha", "curve_beta"}.issubset(filtered.columns):
         curve_params = (
             filtered.groupby("influencer_id")
@@ -288,7 +288,7 @@ else:
         inf_summary["mean_cpa"].replace([np.inf, -np.inf], np.nan).fillna(0)
     )
 
-    # Budget inputs: numeric for real budget, slider for graph range
+    # Budget inputs
     min_budget = max(10_000, int(filtered["total_spend"].quantile(0.1)))
     max_budget_default = int(filtered["total_spend"].quantile(0.9) * 5)
 
@@ -331,14 +331,24 @@ else:
 
     best_single = ranked.iloc[0]
     single_rev = best_single["expected_revenue_at_budget"]
+    single_roas = best_single["expected_roas_at_budget"]
 
-    combo = ranked.head(top_n).copy()
-    combo["allocated_budget"] = budget / top_n
-    combo["expected_revenue"] = combo.apply(
-        lambda r: expected_rev_for_row(r, r["allocated_budget"]), axis=1
-    )
-    total_combo_rev = combo["expected_revenue"].sum()
-    combo_roas = total_combo_rev / budget if budget > 0 else 0
+    # Combo logic
+    if top_n == 1:
+        # Combo == best single
+        combo = ranked.head(1).copy()
+        combo["allocated_budget"] = budget
+        combo["expected_revenue"] = combo["expected_revenue_at_budget"]
+        total_combo_rev = single_rev
+        combo_roas = single_roas
+    else:
+        combo = ranked.head(top_n).copy()
+        combo["allocated_budget"] = budget / top_n
+        combo["expected_revenue"] = combo.apply(
+            lambda r: expected_rev_for_row(r, r["allocated_budget"]), axis=1
+        )
+        total_combo_rev = combo["expected_revenue"].sum()
+        combo_roas = total_combo_rev / budget if budget > 0 else 0
 
     colA, colB = st.columns(2)
 
@@ -346,7 +356,7 @@ else:
         st.markdown("**Best single influencer (by expected revenue at this budget)**")
         st.write(
             f"{best_single['influencer_handle']} ({best_single['influencer_tier']}), "
-            f"expected ROAS ≈ {best_single['expected_roas_at_budget']:.2f}x"
+            f"expected ROAS ≈ {single_roas:.2f}x"
         )
         st.write(f"Budget: ₹{budget:,.0f} → Expected revenue ≈ ₹{single_rev:,.0f}")
 
@@ -384,13 +394,27 @@ else:
             f"(ROAS ≈ {combo_roas:.2f}x)"
         )
 
-    st.markdown("#### Budget vs expected revenue")
+    # ------------------ GRAPHS ------------------
 
-    budgets = np.linspace(min_budget, graph_max_budget, 30)
+    st.markdown("### Budget vs expected revenue (non-linear curves)")
+
+    budgets = np.linspace(min_budget, graph_max_budget, 40)
+
+    # Best single curve
     single_curve = spend_to_revenue(
         budgets, best_single["k"], best_single["alpha"], best_single["beta"]
     )
-    combo_curve = budgets * combo_roas  # approximation for combo
+
+    # Combo curve: sum each influencer's curve at its share of budget
+    if top_n == 1:
+        combo_curve = single_curve.copy()
+    else:
+        combo_curve = np.zeros_like(budgets, dtype=float)
+        for _, row in combo.iterrows():
+            share = 1.0 / top_n
+            combo_curve += spend_to_revenue(
+                budgets * share, row["k"], row["alpha"], row["beta"]
+            )
 
     plot_df = pd.DataFrame(
         {
@@ -399,14 +423,10 @@ else:
             f"Top {top_n} combo": combo_curve.astype(float),
         }
     )
+    long_rev = plot_df.melt(id_vars="budget", var_name="Scenario", value_name="revenue")
 
-    plot_long = plot_df.melt(id_vars="budget", var_name="Scenario", value_name="revenue")
-    plot_long = plot_long.replace([np.inf, -np.inf], np.nan).dropna(
-        subset=["budget", "revenue"]
-    )
-
-    chart = (
-        alt.Chart(plot_long)
+    rev_chart = (
+        alt.Chart(long_rev)
         .mark_line()
         .encode(
             x=alt.X("budget:Q", title="Budget (₹)"),
@@ -416,11 +436,67 @@ else:
         )
         .interactive()
     )
+    st.altair_chart(rev_chart, use_container_width=True)
 
-    st.altair_chart(chart, use_container_width=True)
+    # ROAS vs budget
+    st.markdown("### Budget vs expected ROAS")
+
+    roas_single = single_curve / budgets
+    roas_combo = combo_curve / budgets
+
+    roas_df = pd.DataFrame(
+        {
+            "budget": budgets.astype(float),
+            "Best single": roas_single.astype(float),
+            f"Top {top_n} combo": roas_combo.astype(float),
+        }
+    )
+    long_roas = roas_df.melt(id_vars="budget", var_name="Scenario", value_name="roas")
+
+    roas_chart = (
+        alt.Chart(long_roas)
+        .mark_line()
+        .encode(
+            x=alt.X("budget:Q", title="Budget (₹)"),
+            y=alt.Y("roas:Q", title="Expected ROAS (x)"),
+            color=alt.Color("Scenario:N", title="Scenario"),
+            tooltip=["budget", "Scenario", "roas"],
+        )
+        .interactive()
+    )
+    st.altair_chart(roas_chart, use_container_width=True)
+
+    # Marginal revenue vs budget (approx first derivative)
+    st.markdown("### Marginal revenue per extra ₹ (diminishing returns)")
+
+    marg_single = np.diff(single_curve) / np.diff(budgets)
+    marg_combo = np.diff(combo_curve) / np.diff(budgets)
+    mid_budgets = (budgets[:-1] + budgets[1:]) / 2
+
+    marg_df = pd.DataFrame(
+        {
+            "budget": mid_budgets.astype(float),
+            "Best single": marg_single.astype(float),
+            f"Top {top_n} combo": marg_combo.astype(float),
+        }
+    )
+    long_marg = marg_df.melt(id_vars="budget", var_name="Scenario", value_name="marginal")
+
+    marg_chart = (
+        alt.Chart(long_marg)
+        .mark_line()
+        .encode(
+            x=alt.X("budget:Q", title="Budget (₹)"),
+            y=alt.Y("marginal:Q", title="Marginal revenue per extra ₹"),
+            color=alt.Color("Scenario:N", title="Scenario"),
+            tooltip=["budget", "Scenario", "marginal"],
+        )
+        .interactive()
+    )
+    st.altair_chart(marg_chart, use_container_width=True)
 
     st.caption(
-        "Curves use non-linear response functions fitted per influencer. "
-        "At higher budgets you may see diminishing or declining returns, "
-        "so the app can recommend switching to other influencers or combos."
+        "When Top 1 combo is selected, its curves are identical to the best single influencer. "
+        "For higher N, combo curves are the sum of each influencer's non-linear response, "
+        "so shapes can differ (e.g., more stable or less peaky)."
     )
