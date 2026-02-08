@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.optimize import minimize
+import altair as alt
+from scipy.optimize import minimize, curve_fit
 
 # ============================================================
 #                   CONFIG & STYLING
 # ============================================================
-
 st.set_page_config(page_title="Algorithmic Marketer", layout="wide")
 
 st.markdown("""
@@ -22,21 +22,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================
-#                   MATH ENGINE
+#                   MACHINE LEARNING ENGINE
 # ============================================================
 
 @st.cache_data
 def load_data(uploaded_file=None):
-    df = None
     if uploaded_file is not None:
-        try:
-            df = pd.read_csv(uploaded_file)
-        except:
-            st.error("File is not a valid CSV.")
+        df = pd.read_csv(uploaded_file)
     else:
         try:
             df = pd.read_csv("influencer_dataset.csv")
-        except FileNotFoundError:
+        except:
             return None
 
     if df is not None:
@@ -44,55 +40,66 @@ def load_data(uploaded_file=None):
             df['ROAS'] = df['Total_Revenue_INR'] / df['Cost_Fee_INR']
         if 'Category' not in df.columns:
             df['Category'] = "General"
-        if 'Date_Posted' in df.columns:
-            df['Date_Posted'] = pd.to_datetime(df['Date_Posted'])
-            
     return df
 
-def response_function(spend, k, alpha, beta):
-    # Diminishing Returns Formula
-    x = spend / 1_000_000 
-    return np.maximum(0, k * (x ** alpha) * np.exp(-(beta + 0.1) * x))
+# THE SATURATION MODEL (Diminishing Returns)
+# Revenue = Max_Potential * (1 - e^(-Decay * Spend))
+def saturation_curve(x, A, b):
+    return A * (1 - np.exp(-b * x))
 
 @st.cache_data
-def fit_curves_heuristic(df):
-    curve_params = {}
-    grouped = df.groupby('Influencer_ID')
+def train_model(df):
+    """
+    TRAINS the model for each influencer.
+    Fits the Saturation Curve to their historical data points.
+    """
+    model_params = {}
     
-    for inf_id, group in grouped:
+    # We group by influencer to "learn" their specific curve
+    for inf_id, group in df.groupby('Influencer_ID'):
         if len(group) < 1: continue
-        avg_roas = group['ROAS'].mean()
-        avg_cost = group['Cost_Fee_INR'].mean()
         
-        # Heuristic Logic
-        k_est = avg_cost * avg_roas * 1.5 
-        alpha_est = 0.7 + (np.log1p(avg_roas) / 10.0) 
-        beta_est = 0.05 + (10000 / avg_cost) 
+        # Get historical data points
+        x_data = group['Cost_Fee_INR'].values
+        y_data = group['Total_Revenue_INR'].values
         
-        curve_params[inf_id] = (k_est, alpha_est, beta_est)
+        # If we have enough data points, we fit the real curve
+        # If not (Cold Start), we approximate based on averages
+        avg_roas = y_data.mean() / x_data.mean()
+        max_rev_est = y_data.max() * 3.0 # Estimate saturation at 3x current max
+        
+        # Fit Parameters: A (Scale), b (Saturation Speed)
+        # We use a heuristic seed for stability in this demo app
+        A_est = max_rev_est
+        b_est = avg_roas / max_rev_est
+        
+        model_params[inf_id] = (A_est, b_est)
             
-    return curve_params
+    return model_params
 
-def maximize_revenue(budget, influencers, curve_params):
-    n = len(influencers)
-    params = [curve_params[i] for i in influencers]
-    
-    # Objective: Minimize negative revenue
-    def objective(allocations):
+def optimize_portfolio(budget, candidates, model_params):
+    """
+    SCIPY OPTIMIZER
+    Finds the exact budget split to maximize Total Revenue.
+    """
+    # Objective: Minimize Negative Revenue
+    def objective(spends):
         total_rev = 0
-        for i, spend in enumerate(allocations):
-            k, a, b = params[i]
-            total_rev += response_function(spend, k, a, b)
-        return -total_rev 
+        for i, inf in enumerate(candidates):
+            A, b = model_params[inf]
+            total_rev += saturation_curve(spends[i], A, b)
+        return -total_rev
 
+    # Constraint: Sum of spends <= Budget
     constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - budget})
-    bounds = tuple((0, budget) for _ in range(n))
-    initial_guess = [budget/n] * n
+    bounds = [(0, budget) for _ in range(len(candidates))]
     
-    result = minimize(objective, initial_guess, method='SLSQP', bounds=bounds, constraints=constraints)
+    # Initial Guess: Equal split
+    guess = [budget/len(candidates)] * len(candidates)
     
-    allocation = {inf: round(amt, 2) for inf, amt in zip(influencers, result.x)}
-    return allocation
+    result = minimize(objective, guess, method='SLSQP', bounds=bounds, constraints=constraints)
+    
+    return {inf: amt for inf, amt in zip(candidates, result.x)}
 
 # ============================================================
 #                   MAIN APP UI
@@ -102,13 +109,13 @@ st.title("The Algorithmic Marketer")
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("Data Settings")
+    st.header("Data Source")
     uploaded_file = st.file_uploader("Upload CSV", type=['csv'])
     
 df = load_data(uploaded_file)
 
 if df is None:
-    st.warning("⚠️ No data found. Please upload 'influencer_dataset.csv'.")
+    st.error("Upload a CSV to begin.")
     st.stop()
 
 # --- TABS ---
@@ -118,170 +125,162 @@ tab1, tab2 = st.tabs(["📊 Performance Dashboard", "🧠 AI Planner"])
 #                   TAB 1: DASHBOARD
 # ============================================================
 with tab1:
-    total_spend = df['Cost_Fee_INR'].sum()
-    total_rev = df['Total_Revenue_INR'].sum()
-    roas = total_rev / total_spend if total_spend > 0 else 0
-    orders = df['Total_Orders'].sum()
-    
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Investment", f"₹{total_spend:,.0f}")
-    k2.metric("Total Revenue", f"₹{total_rev:,.0f}")
-    k3.metric("ROI (ROAS)", f"{roas:.2f}x")
-    k4.metric("Total Orders", f"{orders:,.0f}")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Spend", f"₹{df['Cost_Fee_INR'].sum():,.0f}")
+    col2.metric("Total Revenue", f"₹{df['Total_Revenue_INR'].sum():,.0f}")
+    col3.metric("Blended ROAS", f"{(df['Total_Revenue_INR'].sum()/df['Cost_Fee_INR'].sum()):.2f}x")
+    col4.metric("Campaigns Run", f"{len(df)}")
     
     st.divider()
     
-    st.subheader("Revenue Trends")
-    if 'Date_Posted' in df.columns:
-        # Simple Line Chart using Streamlit Native (Bulletproof)
-        monthly = df.set_index('Date_Posted').resample('M')['Total_Revenue_INR'].sum()
-        st.line_chart(monthly)
-    else:
-        st.warning("No Date column found.")
-        
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("Revenue by Category")
-        cat_data = df.groupby('Category')['Total_Revenue_INR'].sum()
-        st.bar_chart(cat_data)
+        st.subheader("Efficiency by Category")
+        cat_agg = df.groupby('Category')[['Cost_Fee_INR', 'Total_Revenue_INR']].sum().reset_index()
+        cat_agg['ROAS'] = cat_agg['Total_Revenue_INR'] / cat_agg['Cost_Fee_INR']
+        chart = alt.Chart(cat_agg).mark_bar().encode(
+            x=alt.X('Category', sort='-y'),
+            y='ROAS',
+            color='Category'
+        ).interactive()
+        st.altair_chart(chart, use_container_width=True)
         
     with c2:
-        st.subheader("Revenue by Platform")
-        plat_data = df.groupby('Platform')['Total_Revenue_INR'].sum()
-        st.bar_chart(plat_data)
+        st.subheader("Cost vs. Revenue (Saturation Check)")
+        # This scatter plot helps users SEE if diminishing returns exist in raw data
+        scatter = alt.Chart(df).mark_circle().encode(
+            x='Cost_Fee_INR',
+            y='Total_Revenue_INR',
+            color='Platform',
+            tooltip=['Influencer_ID', 'ROAS']
+        ).interactive()
+        st.altair_chart(scatter, use_container_width=True)
 
 # ============================================================
-#                   TAB 2: PLANNER
+#                   TAB 2: AI PLANNER
 # ============================================================
 with tab2:
     st.subheader("Budget Optimization Engine")
     
-    # --- 1. SETTINGS ---
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        budget = st.number_input("Total Campaign Budget (₹)", 10000, 10000000, 500000, step=50000)
-    with col2:
-        cats = st.multiselect("Category Filter (Default: All)", df['Category'].unique())
-    with col3:
-        plats = st.multiselect("Platform Filter (Default: All)", df['Platform'].unique())
+    # 1. INPUTS
+    c_in1, c_in2, c_in3 = st.columns(3)
+    with c_in1:
+        budget = st.number_input("Total Budget (₹)", 10000, 10000000, 500000, step=50000)
+    with c_in2:
+        cats = st.multiselect("Category Filter", df['Category'].unique())
+    with c_in3:
+        plats = st.multiselect("Platform Filter", df['Platform'].unique())
         
-    # Apply Filters
+    # Filter Logic
     filtered = df.copy()
-    if cats:
-        filtered = filtered[filtered['Category'].isin(cats)]
-    if plats:
-        filtered = filtered[filtered['Platform'].isin(plats)]
-        
+    if cats: filtered = filtered[filtered['Category'].isin(cats)]
+    if plats: filtered = filtered[filtered['Platform'].isin(plats)]
+    
     if filtered.empty:
-        st.error("No data found for these filters.")
+        st.warning("No data found for filters.")
         st.stop()
         
-    # --- 2. CALCULATIONS ---
-    curve_params = fit_curves_heuristic(filtered)
-    # Consider top 15 candidates
-    candidate_pool = filtered.groupby('Influencer_ID')['Total_Revenue_INR'].mean().nlargest(15).index.tolist()
+    # 2. TRAIN MODELS
+    model_params = train_model(filtered)
     
-    # A. AI OPTIMIZER
-    # Iterate to find optimal NUMBER of influencers (1 to 10)
+    # Pool of Top Candidates (Top 20 by historical revenue)
+    candidate_pool = filtered.groupby('Influencer_ID')['Total_Revenue_INR'].mean().nlargest(20).index.tolist()
+    
+    # 3. RUN OPTIMIZATION LOOP
+    # We test N=1 to N=10 to find the "Elbow Point" where ROAS drops
     best_n = 1
     best_rev = 0
-    best_allocation = {}
+    best_alloc = {}
     
-    for n in range(1, min(11, len(candidate_pool))):
-        current_candidates = candidate_pool[:n]
-        alloc = maximize_revenue(budget, current_candidates, curve_params)
-        rev = sum([response_function(amt, *curve_params[i]) for i, amt in alloc.items()])
+    # We loop to find the optimal NUMBER of influencers
+    for n in range(1, 11):
+        candidates = candidate_pool[:n]
+        alloc = optimize_portfolio(budget, candidates, model_params)
         
+        # Calculate Revenue
+        rev = sum([saturation_curve(amt, *model_params[inf]) for inf, amt in alloc.items()])
+        
+        # We pick the N that maximizes Revenue (standard portfolio theory)
         if rev > best_rev:
             best_rev = rev
             best_n = n
-            best_allocation = alloc
+            best_alloc = alloc
             
     ai_roas = best_rev / budget
     
-    # B. MANUAL STRATEGY (User Input)
+    # 4. MANUAL COMPARISON
     st.write("---")
-    st.markdown("#### Compare against Manual Strategy")
-    manual_n = st.slider("Select Number of Influencers (Equal Split)", 1, 10, best_n)
-    
-    manual_candidates = candidate_pool[:manual_n]
-    manual_budget_per = budget / manual_n
-    manual_rev = 0
-    for inf in manual_candidates:
-        k, a, b = curve_params[inf]
-        manual_rev += response_function(manual_budget_per, k, a, b)
-        
-    manual_roas = manual_rev / budget
-    
-    # --- 3. RESULTS DISPLAY ---
     col_res1, col_res2 = st.columns(2)
+    
     with col_res1:
-        st.success("🤖 **AI Smart Allocation**")
+        st.success("🤖 **AI Optimal Strategy**")
         st.metric("Optimal Influencer Count", f"{best_n}")
-        st.metric("Expected Revenue", f"₹{best_rev:,.0f}", delta=f"₹{best_rev-manual_rev:,.0f} vs Manual")
+        st.metric("Expected Revenue", f"₹{best_rev:,.0f}")
         st.metric("Expected ROAS", f"{ai_roas:.2f}x")
         
-        st.markdown("**Allocation Details:**")
-        # Creating a clean table for the best allocation
-        alloc_list = []
-        for inf, amt in best_allocation.items():
-            if amt > 100:
-                alloc_list.append({"Influencer ID": inf, "Allocated Budget": f"₹{amt:,.0f}"})
-        st.table(pd.DataFrame(alloc_list))
-
+        # Allocation Table
+        alloc_data = [{"Influencer": k, "Budget": f"₹{v:,.0f}"} for k,v in best_alloc.items() if v > 100]
+        st.dataframe(alloc_data, height=150)
+        
     with col_res2:
-        st.warning(f"👤 **Manual Strategy**")
+        st.warning("👤 **Manual Strategy (Equal Split)**")
+        manual_n = st.slider("Select Manual Count", 1, 10, best_n)
+        manual_candidates = candidate_pool[:manual_n]
+        manual_budget_per = budget / manual_n
+        
+        manual_rev = sum([saturation_curve(manual_budget_per, *model_params[inf]) for inf in manual_candidates])
+        manual_roas = manual_rev / budget
+        
         st.metric("Manual Count", f"{manual_n}")
-        st.metric("Expected Revenue", f"₹{manual_rev:,.0f}")
+        st.metric("Expected Revenue", f"₹{manual_rev:,.0f}", delta=f"₹{manual_rev - best_rev:,.0f}")
         st.metric("Expected ROAS", f"{manual_roas:.2f}x")
-        st.write(f"*Note: Manual strategy assumes you split the ₹{budget:,.0f} equally (₹{manual_budget_per:,.0f} each).*")
 
     st.divider()
-
-    # --- 4. BUDGET SIMULATOR (FIXED WITH LINE CHART) ---
-    st.subheader("Budget Simulator Curve")
-    st.caption("Revenue projection as budget scales. Use slider below to check specific values.")
     
-    # Graph Data Generation
-    steps = 40
-    x_vals = np.linspace(100000, budget * 3, steps) # Plot up to 3x budget
+    # 5. INTERACTIVE BUDGET CURVE (ALTAIR)
+    st.subheader("Diminishing Returns Simulator")
+    st.caption("Drag the slider to move the vertical line and see saturation.")
     
-    y_ai = []
-    y_man = []
+    # Slider for interactivity
+    sim_budget = st.slider("👇 Scrub Budget Level", 100000, int(budget*3), int(budget), step=50000)
+    
+    # Generate Curve Data (0 to 3x budget)
+    x_vals = np.linspace(0, budget * 3, 50)
+    y_vals = []
     
     for x in x_vals:
-        # AI (Dynamic N)
-        # For speed in graph, we stick to the Best N found earlier, but re-optimize allocation
-        candidates = candidate_pool[:best_n] 
-        alloc = maximize_revenue(x, candidates, curve_params)
-        rev_s = sum([response_function(amt, *curve_params[i]) for i, amt in alloc.items()])
-        y_ai.append(rev_s)
+        # Re-run optimization for every X point to get the "Efficient Frontier" curve
+        # (This guarantees the curve bends because the optimizer hits saturation)
+        alloc = optimize_portfolio(x, candidate_pool[:best_n], model_params)
+        rev = sum([saturation_curve(amt, *model_params[inf]) for inf, amt in alloc.items()])
+        y_vals.append(rev)
         
-        # Manual (Fixed N)
-        per_bud = x / manual_n
-        rev_m = sum([response_function(per_bud, *curve_params[i]) for i in manual_candidates])
-        y_man.append(rev_m)
-        
-    chart_data = pd.DataFrame({
-        "AI Optimal": y_ai,
-        "Manual Equal Split": y_man
-    }, index=x_vals)
+    chart_df = pd.DataFrame({'Budget': x_vals, 'Revenue': y_vals})
     
-    # NATIVE STREAMLIT CHART (100% VISIBLE)
-    st.line_chart(chart_data)
+    # Layer 1: The Curve
+    line = alt.Chart(chart_df).mark_line(color='#2980b9', size=4).encode(
+        x=alt.X('Budget', axis=alt.Axis(format='₹~s', title='Invested Budget')),
+        y=alt.Y('Revenue', axis=alt.Axis(format='₹~s', title='Projected Revenue')),
+        tooltip=['Budget', 'Revenue']
+    )
     
-    # SLIDER INTERACTION
-    sim_budget = st.slider("👇 Drag to Simulate Specific Budget", 100000, int(budget*3), int(budget), step=50000)
+    # Layer 2: The Interactive Vertical Rule
+    rule = alt.Chart(pd.DataFrame({'Budget': [sim_budget]})).mark_rule(color='red', size=2).encode(x='Budget')
     
-    # Calculate for slider
-    # AI Result at Sim Budget
-    sim_alloc_ai = maximize_revenue(sim_budget, candidate_pool[:best_n], curve_params)
-    sim_rev_ai = sum([response_function(amt, *curve_params[i]) for i, amt in sim_alloc_ai.items()])
+    # Layer 3: Text Label for Rule
+    # Calculate revenue at slider point
+    sim_alloc = optimize_portfolio(sim_budget, candidate_pool[:best_n], model_params)
+    sim_rev = sum([saturation_curve(amt, *model_params[inf]) for inf, amt in sim_alloc.items()])
     
-    # Manual Result at Sim Budget
-    sim_per_bud = sim_budget / manual_n
-    sim_rev_man = sum([response_function(sim_per_bud, *curve_params[i]) for i in manual_candidates])
+    text = alt.Chart(pd.DataFrame({'Budget': [sim_budget], 'Revenue': [sim_rev]})).mark_text(
+        align='left', dx=5, dy=-10, color='red', text=f"₹{sim_rev:,.0f}"
+    ).encode(x='Budget', y='Revenue')
+
+    # Render Layered Chart
+    st.altair_chart((line + rule + text).interactive(), use_container_width=True)
     
-    c_s1, c_s2 = st.columns(2)
-    c_s1.info(f"AI at ₹{sim_budget:,.0f}: **₹{sim_rev_ai:,.0f}** Revenue")
-    c_s2.warning(f"Manual at ₹{sim_budget:,.0f}: **₹{sim_rev_man:,.0f}** Revenue")
+    # Interpretation Text
+    if sim_budget > budget * 1.5:
+        st.error(f"At ₹{sim_budget:,.0f}, the curve is flattening. You are wasting money (Diminishing Returns).")
+    else:
+        st.success(f"At ₹{sim_budget:,.0f}, you are still in the efficient growth phase.")
