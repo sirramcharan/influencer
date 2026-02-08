@@ -114,7 +114,7 @@ if df is None:
 tab1, tab2 = st.tabs(["📊 Performance Dashboard", "🧠 AI Planner"])
 
 # ============================================================
-#                   TAB 1: DASHBOARD (UNTOUCHED)
+#                   TAB 1: DASHBOARD
 # ============================================================
 with tab1:
     total_spend = df['Cost_Fee_INR'].sum()
@@ -205,7 +205,6 @@ with tab2:
         
     # 2. CALCULATIONS
     curve_params = fit_curves_heuristic(filtered)
-    # Pool top candidates for optimization
     candidate_pool = filtered.groupby('Influencer_ID')['Total_Revenue_INR'].mean().nlargest(20).index.tolist()
     
     # A. AI OPTIMIZER LOOP
@@ -227,7 +226,7 @@ with tab2:
     
     # B. MANUAL COMPARISON
     st.write("---")
-    st.markdown("#### Comparison Strategy")
+    st.markdown("#### Compare Strategy")
     manual_n = st.slider("Select Manual Count (Equal Split)", 1, 10, best_n)
     manual_candidates = candidate_pool[:manual_n]
     manual_budget_per = budget / manual_n
@@ -243,7 +242,6 @@ with tab2:
         st.metric("Expected Revenue", f"₹{best_rev:,.0f}", delta=f"₹{best_rev-manual_rev:,.0f}")
         st.metric("Expected ROAS", f"{ai_roas:.2f}x", delta=f"{ai_roas-manual_roas:.2f}x")
         
-        # LIST ALLOCATION (FIXED: Shows all > 0)
         alloc_list = [{"Influencer": k, "Allocated Budget": f"₹{v:,.0f}"} for k,v in best_allocation.items() if v > 1.0]
         st.table(pd.DataFrame(alloc_list))
 
@@ -260,19 +258,18 @@ with tab2:
     st.subheader("Budget Simulator Curve")
     st.caption("Revenue projection as budget scales (AI vs Manual)")
     
-    # Generate Data (0 to 3x budget)
     steps = 40
-    x_vals = np.linspace(100000, budget * 3, steps)
+    x_vals = np.linspace(50000, budget * 3, steps)
     y_ai = []
     y_man = []
     
     for x in x_vals:
-        # AI Logic
+        # AI
         alloc = maximize_revenue(x, candidate_pool[:best_n], curve_params)
         rev_s = sum([response_function(amt, *curve_params[i]) for i, amt in alloc.items()])
         y_ai.append(rev_s)
         
-        # Manual Logic
+        # Manual
         per_bud = x / manual_n
         rev_m = sum([response_function(per_bud, *curve_params[i]) for i in manual_candidates])
         y_man.append(rev_m)
@@ -284,10 +281,8 @@ with tab2:
     
     st.line_chart(chart_df)
     
-    # Slider Interaction
-    sim_budget = st.slider("👇 Drag to Check Revenue at Specific Budget", 100000, int(budget*3), int(budget), step=50000)
+    sim_budget = st.slider("👇 Drag to Check Specific Revenue", 50000, int(budget*3), int(budget), step=50000)
     
-    # Single Point Calculation
     sim_alloc = maximize_revenue(sim_budget, candidate_pool[:best_n], curve_params)
     sim_rev_ai = sum([response_function(amt, *curve_params[i]) for i, amt in sim_alloc.items()])
     
@@ -301,30 +296,36 @@ with tab2:
     st.divider()
 
     # ============================================================
-    #      NEW SECTION: MANUAL STRATEGY ANALYSIS (ADDED HERE)
+    #      NEW SECTION: STRATEGY COMPARISON GRAPH
     # ============================================================
-    st.subheader("Manual Strategy Analysis: Effect of Portfolio Size")
-    st.caption("How ROAS changes as you manually add more influencers (splitting budget equally).")
+    st.subheader("Strategy Comparison: Effect of Portfolio Size")
+    st.caption("Compare ROAS of Equal Split (Manual) vs. Optimized Split (AI) as you add influencers.")
 
-    # Generate Data: ROAS vs N (Number of Influencers)
-    # We iterate from 1 to 20 influencers (or max available)
     max_test_n = min(20, len(candidate_pool))
     n_values = range(1, max_test_n + 1)
-    roas_values = []
+    
+    manual_roas_vals = []
+    ai_roas_vals = []
 
     for n in n_values:
-        # Calculate ROAS if we split Current Budget equally among top N
-        current_candidates = candidate_pool[:n]
-        budget_per_inf = budget / n
+        candidates = candidate_pool[:n]
         
-        total_rev_n = sum([response_function(budget_per_inf, *curve_params[i]) for i in current_candidates])
-        roas_n = total_rev_n / budget
-        roas_values.append(roas_n)
+        # 1. Manual ROAS (Equal Split)
+        budget_per = budget / n
+        rev_man = sum([response_function(budget_per, *curve_params[i]) for i in candidates])
+        manual_roas_vals.append(rev_man / budget)
+        
+        # 2. AI ROAS (Optimized Split)
+        # We re-run the optimizer for THIS specific set of N candidates
+        alloc_ai = maximize_revenue(budget, candidates, curve_params)
+        rev_ai = sum([response_function(amt, *curve_params[i]) for i, amt in alloc_ai.items()])
+        ai_roas_vals.append(rev_ai / budget)
 
-    # Plot
-    roas_df = pd.DataFrame({
-        "Manual ROAS": roas_values
+    # Plot Comparison
+    comparison_df = pd.DataFrame({
+        "Manual ROAS (Equal Split)": manual_roas_vals,
+        "AI ROAS (Optimized Allocation)": ai_roas_vals
     }, index=n_values)
 
-    st.line_chart(roas_df)
-    st.info("This graph helps you find the 'Sweet Spot' for manual selection. Notice how ROAS peaks and then drops as you dilute the budget too much.")
+    st.line_chart(comparison_df)
+    st.info("Notice how the **AI ROAS (Blue)** often stays higher than Manual because it intelligently allocates money to the best performers in the group, rather than wasting it on the weaker ones.")
