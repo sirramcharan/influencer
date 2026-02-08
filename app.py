@@ -21,7 +21,6 @@ st.markdown("""
         color: rgb(30, 30, 30);
         overflow-wrap: break-word;
     }
-    /* Break long metric labels */
     div[data-testid="metric-container"] > label {
         font-size: 1rem;
         color: rgb(49, 51, 63);
@@ -33,15 +32,30 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 @st.cache_data
-def load_data():
+def load_data(uploaded_file=None):
     """
-    Load the dataset. 
-    In a real app, you might connect to a database or cloud storage.
-    Here we expect 'influencer_dataset.csv' in the same folder.
+    Load data from an uploaded file OR fall back to the default repo file.
     """
-    try:
-        df = pd.read_csv("influencer_dataset.csv")
-        
+    df = None
+    
+    # 1. Try loading uploaded file if present
+    if uploaded_file is not None:
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"Error reading uploaded file: {e}")
+            return None
+            
+    # 2. If no upload, try loading default from repo
+    elif df is None:
+        try:
+            df = pd.read_csv("influencer_dataset.csv")
+        except FileNotFoundError:
+            # Return None to handle gracefully in main app
+            return None
+            
+    # 3. Preprocessing (Standardize columns)
+    if df is not None:
         # Ensure date column is datetime
         if 'Date_Posted' in df.columns:
             df['Date_Posted'] = pd.to_datetime(df['Date_Posted'])
@@ -56,59 +70,37 @@ def load_data():
                 (df['Likes'] + df['Comments'] + df['Shares']) / df['Impressions'].replace(0, np.nan)
             ).fillna(0)
 
-        return df
-    except FileNotFoundError:
-        return None
+    return df
 
-# Non-linear response curve function: Revenue = k * (Spend^alpha) * exp(-beta * Spend)
-# Normalized Spend (Spend / 1M) is used to keep numbers stable for optimization
+# Non-linear response curve function
 def response_curve(spend, k, alpha, beta):
     spend_norm = spend / 1_000_000 # Normalize to Millions
-    # Prevent negative or complex results
     return np.maximum(0, k * (spend_norm ** alpha) * np.exp(-beta * spend_norm))
 
 @st.cache_data
 def fit_curves(df):
-    """
-    Fit a response curve for every influencer in the dataset.
-    Returns a dictionary of parameters {influencer_id: (k, alpha, beta)}
-    """
+    """Fit a response curve for every influencer in the dataset."""
     curve_params = {}
-    
-    # We need enough data points per influencer to fit a curve.
-    # If not enough, we use a "Category Average" fallback.
-    
-    # Group by Influencer
     grouped = df.groupby('Influencer_ID')
     
     for influencer, group in grouped:
-        # We need at least 3 points to fit 3 parameters. 
-        # But for robustness, let's say 5. 
-        # If synthetic data is small, we might need to relax this or use synthetic points.
-        
         if len(group) < 3:
-            # Fallback: Use generic parameters based on their Tier if possible, 
-            # or just generic defaults.
-            # (k, alpha, beta)
             curve_params[influencer] = (1000000, 0.8, 0.1) 
             continue
             
         X = group['Cost_Fee_INR'].values
         y = group['Total_Revenue_INR'].values
         
-        # Bounds: k>0, 0<alpha<2 (diminishing returns), beta>=0 (saturation)
         try:
             popt, _ = curve_fit(
                 response_curve, 
-                X, 
-                y, 
-                p0=[500000, 0.9, 0.05], # Initial guess
+                X, y, 
+                p0=[500000, 0.9, 0.05],
                 bounds=([1000, 0.1, 0.0], [np.inf, 2.0, 5.0]),
                 maxfev=5000
             )
             curve_params[influencer] = popt
         except:
-             # Fallback if fit fails
             curve_params[influencer] = (1000000, 0.8, 0.1)
             
     return curve_params
@@ -117,13 +109,30 @@ def fit_curves(df):
 #                   MAIN APP LOGIC
 # ============================================================
 
-df = load_data()
+# --- SIDEBAR: DATA UPLOAD ---
+st.sidebar.title("Data Settings")
+uploaded_file = st.sidebar.file_uploader("Upload Campaign CSV", type=["csv"])
+
+# Load data based on user input or default
+df = load_data(uploaded_file)
 
 if df is None:
-    st.error("Dataset 'influencer_dataset.csv' not found. Please upload it to your GitHub repo.")
+    st.info("👋 **Welcome!**")
+    st.warning("⚠️ Default dataset 'influencer_dataset.csv' not found.")
+    st.markdown("""
+    **To fix this:**
+    1. Ensure `influencer_dataset.csv` is in your GitHub repo (root folder).
+    2. OR Upload your own CSV file in the sidebar.
+    """)
     st.stop()
+else:
+    if uploaded_file is None:
+        st.sidebar.success("✅ Loaded Default Demo Data")
+    else:
+        st.sidebar.success("✅ Loaded Your Uploaded Data")
 
-# --- SIDEBAR NAVIGATION ---
+# --- NAVIGATION ---
+st.sidebar.markdown("---")
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to", ["📊 Dashboard", "🧠 Planner"])
 
@@ -133,7 +142,6 @@ page = st.sidebar.radio("Go to", ["📊 Dashboard", "🧠 Planner"])
 if page == "📊 Dashboard":
     st.title("Historical Campaign Performance")
     
-    # --- Top Level KPIs ---
     total_spend = df['Cost_Fee_INR'].sum()
     total_rev = df['Total_Revenue_INR'].sum()
     blended_roas = total_rev / total_spend if total_spend > 0 else 0
@@ -147,25 +155,21 @@ if page == "📊 Dashboard":
     
     st.markdown("---")
     
-    # --- Charts Row 1 ---
     col1, col2 = st.columns(2)
     
     with col1:
         st.subheader("Spend vs Revenue Trend")
-        # Aggregating by Month
-        df['Month'] = df['Date_Posted'].dt.to_period('M').astype(str)
-        monthly_data = df.groupby('Month')[['Cost_Fee_INR', 'Total_Revenue_INR']].sum().reset_index()
-        
-        # Melt for Altair
-        monthly_melt = monthly_data.melt('Month', var_name='Metric', value_name='Amount')
-        
-        chart = alt.Chart(monthly_melt).mark_line(point=True).encode(
-            x='Month',
-            y='Amount',
-            color='Metric',
-            tooltip=['Month', 'Metric', 'Amount']
-        ).interactive()
-        st.altair_chart(chart, use_container_width=True)
+        if 'Date_Posted' in df.columns:
+            df['Month'] = df['Date_Posted'].dt.to_period('M').astype(str)
+            monthly_data = df.groupby('Month')[['Cost_Fee_INR', 'Total_Revenue_INR']].sum().reset_index()
+            monthly_melt = monthly_data.melt('Month', var_name='Metric', value_name='Amount')
+            
+            chart = alt.Chart(monthly_melt).mark_line(point=True).encode(
+                x='Month', y='Amount', color='Metric', tooltip=['Month', 'Metric', 'Amount']
+            ).interactive()
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.warning("Date column not found, skipping trend chart.")
         
     with col2:
         st.subheader("ROAS by Platform")
@@ -183,10 +187,7 @@ if page == "📊 Dashboard":
         ).interactive()
         st.altair_chart(bar_chart, use_container_width=True)
         
-    # --- Leaderboard ---
     st.subheader("Top Performing Influencers")
-    
-    # Group by Influencer to get averages/sums
     leaderboard = df.groupby(['Influencer_ID', 'Influencer_Tier']).agg(
         Total_Spend=('Cost_Fee_INR', 'sum'),
         Total_Revenue=('Total_Revenue_INR', 'sum'),
@@ -194,18 +195,13 @@ if page == "📊 Dashboard":
         Campaign_Count=('Campaign_ID', 'count')
     ).reset_index()
     
-    # Filter out one-off wonders (optional: keep only those with >1 campaign if data allows)
-    # leaderboard = leaderboard[leaderboard['Campaign_Count'] > 1]
-    
     top_n = leaderboard.sort_values('Avg_ROAS', ascending=False).head(10)
-    
     st.dataframe(
         top_n.style.format({
             "Total_Spend": "₹{:,.0f}", 
             "Total_Revenue": "₹{:,.0f}", 
             "Avg_ROAS": "{:.2f}x"
-        }),
-        use_container_width=True
+        }), use_container_width=True
     )
 
 # ============================================================
@@ -214,15 +210,8 @@ if page == "📊 Dashboard":
 elif page == "🧠 Planner":
     st.title("Budget Optimization Engine")
     
-    st.markdown("""
-    > **How this works:** This tool uses non-linear regression (diminishing returns) to calculate the 
-    > optimal way to split your budget. It compares putting all eggs in one basket (Single Strategy) 
-    > vs. diversifying across a portfolio (Combinatorial Strategy).
-    """)
-    
-    # --- 1. Inputs ---
     with st.sidebar:
-        st.header("Campaign Settings")
+        st.header("Optimization Settings")
         budget = st.number_input("Total Budget (₹)", min_value=10000, max_value=5000000, value=500000, step=10000)
         
         platform_filter = st.multiselect(
@@ -237,7 +226,6 @@ elif page == "🧠 Planner":
             default=df['Influencer_Tier'].unique()
         )
     
-    # --- 2. Filter Data & Fit Curves ---
     filtered_df = df[
         (df['Platform'].isin(platform_filter)) & 
         (df['Influencer_Tier'].isin(tier_filter))
@@ -249,18 +237,11 @@ elif page == "🧠 Planner":
         
     curve_params = fit_curves(filtered_df)
     
-    # --- 3. Optimization Logic ---
-    
-    # Calculate Expected Revenue for EVERY influencer at full budget
     influencer_scores = []
-    
     for inf_id, params in curve_params.items():
         k, alpha, beta = params
         expected_rev = response_curve(budget, k, alpha, beta)
-        
-        # Get metadata for display
         meta = filtered_df[filtered_df['Influencer_ID'] == inf_id].iloc[0]
-        
         influencer_scores.append({
             "Influencer_ID": inf_id,
             "Tier": meta['Influencer_Tier'],
@@ -271,18 +252,12 @@ elif page == "🧠 Planner":
         
     scores_df = pd.DataFrame(influencer_scores)
     
-    # STRATEGY A: BEST SINGLE
+    # STRATEGIES
     best_single = scores_df.sort_values('Expected_Rev_Full_Budget', ascending=False).iloc[0]
     rev_single = best_single['Expected_Rev_Full_Budget']
     roas_single = rev_single / budget
     
-    # STRATEGY B: TOP 3 COMBO (Simple Equal Split Heuristic)
-    # In a full thesis, you'd use scipy.optimize.minimize to find exact split.
-    # Here we simulate an equal split for robustness.
-    
     split_budget = budget / 3
-    
-    # Recalculate revenue for everyone at 1/3 budget
     scores_df['Expected_Rev_Split'] = scores_df['Params'].apply(
         lambda p: response_curve(split_budget, p[0], p[1], p[2])
     )
@@ -291,49 +266,36 @@ elif page == "🧠 Planner":
     rev_combo = top_3_combo['Expected_Rev_Split'].sum()
     roas_combo = rev_combo / budget
     
-    # --- 4. Display Results ---
-    
+    # DISPLAY
     col_a, col_b = st.columns(2)
     
-    # Card A
     with col_a:
         st.subheader("Strategy A: Concentrated")
         st.caption("Invest 100% in Top Performer")
         st.metric("Expected Revenue", f"₹{rev_single:,.0f}")
-        st.metric("Expected ROAS", f"{roas_single:.2f}x", delta_color="off")
+        st.metric("Expected ROAS", f"{roas_single:.2f}x")
         st.write(f"**Influencer:** {best_single['Influencer_ID']} ({best_single['Tier']})")
         
-    # Card B
     with col_b:
         st.subheader("Strategy B: Diversified (Top 3)")
         st.caption("Split Budget Equally (33% each)")
         st.metric("Expected Revenue", f"₹{rev_combo:,.0f}")
-        
-        # Highlight the winner
         delta_val = roas_combo - roas_single
         st.metric("Expected ROAS", f"{roas_combo:.2f}x", delta=f"{delta_val:.2f}x vs Single")
-        
         st.write("**Portfolio:**")
         for _, row in top_3_combo.iterrows():
             st.write(f"- {row['Influencer_ID']} ({row['Tier']})")
 
     st.markdown("---")
+    st.subheader("Diminishing Returns Analysis")
     
-    # --- 5. Visualization: The Diminishing Returns Curve ---
-    st.subheader("The 'Why': Diminishing Returns Analysis")
-    
-    # Generate curve points for plotting
-    x_points = np.linspace(0, budget * 1.5, 50) # Plot up to 1.5x budget to show future saturation
-    
-    # Single Curve
+    x_points = np.linspace(0, budget * 1.5, 50)
     k, a, b = best_single['Params']
     y_single = response_curve(x_points, k, a, b)
     
-    # Combo Curve (Sum of top 3 curves at x/3 spend each)
     y_combo = np.zeros_like(x_points)
     for _, row in top_3_combo.iterrows():
         kp, ap, bp = row['Params']
-        # We assume if total spend is X, each gets X/3
         y_combo += response_curve(x_points/3, kp, ap, bp)
         
     plot_data = pd.DataFrame({
@@ -350,10 +312,3 @@ elif page == "🧠 Planner":
     ).properties(height=400).interactive()
     
     st.altair_chart(line_chart, use_container_width=True)
-    
-    st.info(f"""
-    **Analysis:**
-    - The **Blue Line** (Single) shows how revenue grows if you give everything to {best_single['Influencer_ID']}.
-    - The **Orange Line** (Combo) shows the revenue from splitting budget across 3 influencers.
-    - If the lines cross, that is your **Optimization Tipping Point**.
-    """)
