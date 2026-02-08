@@ -49,11 +49,9 @@ def load_data(uploaded_file=None):
     return df
 
 def response_function(spend, k, alpha, beta):
-    # Diminishing Returns Formula: Revenue = k * (Spend^alpha) * e^(-beta*Spend)
-    # Scaled to millions to prevent overflow
+    # Diminishing Returns Formula
     x = spend / 1_000_000 
-    # STRICTER MATH: We force alpha < 0.9 and beta > 0.1 to guarantee the curve BENDS.
-    return np.maximum(0, k * (x ** alpha) * np.exp(-beta * x))
+    return np.maximum(0, k * (x ** alpha) * np.exp(-(beta + 0.1) * x))
 
 @st.cache_data
 def fit_curves_heuristic(df):
@@ -65,16 +63,10 @@ def fit_curves_heuristic(df):
         avg_roas = group['ROAS'].mean()
         avg_cost = group['Cost_Fee_INR'].mean()
         
-        # Heuristic Logic (Engineered for Diminishing Returns)
-        # 1. K (Scale): Based on cost * ROAS
-        k_est = avg_cost * avg_roas * 1.8 
-        
-        # 2. Alpha (Bend): Must be < 1.0 for diminishing returns. 
-        # We clamp it between 0.6 (fast saturation) and 0.85 (slow saturation)
-        alpha_est = 0.6 + (min(avg_roas, 10) / 40.0) 
-        
-        # 3. Beta (Decay): Higher cost = Lower decay (can absorb more budget)
-        beta_est = 0.08 + (5000 / avg_cost) 
+        # Heuristic Logic
+        k_est = avg_cost * avg_roas * 1.5 
+        alpha_est = 0.7 + (np.log1p(avg_roas) / 10.0) 
+        beta_est = 0.05 + (10000 / avg_cost) 
         
         curve_params[inf_id] = (k_est, alpha_est, beta_est)
             
@@ -96,10 +88,8 @@ def maximize_revenue(budget, influencers, curve_params):
     bounds = tuple((0, budget) for _ in range(n))
     initial_guess = [budget/n] * n
     
-    # Robust Optimizer
     result = minimize(objective, initial_guess, method='SLSQP', bounds=bounds, constraints=constraints)
     
-    # Return allocation
     allocation = {inf: round(amt, 2) for inf, amt in zip(influencers, result.x)}
     return allocation
 
@@ -191,7 +181,7 @@ with tab1:
             st.altair_chart(chart4, use_container_width=True)
 
 # ============================================================
-#                   TAB 2: PLANNER (FIXED)
+#                   TAB 2: PLANNER
 # ============================================================
 with tab2:
     st.subheader("Budget Optimization Engine")
@@ -215,21 +205,19 @@ with tab2:
         
     # 2. CALCULATIONS
     curve_params = fit_curves_heuristic(filtered)
-    # We pool top 15 candidates to run the optimization against
-    candidate_pool = filtered.groupby('Influencer_ID')['Total_Revenue_INR'].mean().nlargest(15).index.tolist()
+    # Pool top candidates for optimization
+    candidate_pool = filtered.groupby('Influencer_ID')['Total_Revenue_INR'].mean().nlargest(20).index.tolist()
     
     # A. AI OPTIMIZER LOOP
-    # Find best N (from 1 to 10 influencers)
     best_n = 1
     best_rev = 0
     best_allocation = {}
     
-    for n in range(1, min(11, len(candidate_pool) + 1)):
+    for n in range(1, min(11, len(candidate_pool))):
         current_pool = candidate_pool[:n]
         alloc = maximize_revenue(budget, current_pool, curve_params)
         rev = sum([response_function(amt, *curve_params[i]) for i, amt in alloc.items()])
         
-        # Standard hill-climbing: if revenue improves, keep going
         if rev > best_rev:
             best_rev = rev
             best_n = n
@@ -240,7 +228,7 @@ with tab2:
     # B. MANUAL COMPARISON
     st.write("---")
     st.markdown("#### Comparison Strategy")
-    manual_n = st.slider("Select Number of Influencers (Equal Split)", 1, 10, best_n)
+    manual_n = st.slider("Select Manual Count (Equal Split)", 1, 10, best_n)
     manual_candidates = candidate_pool[:manual_n]
     manual_budget_per = budget / manual_n
     
@@ -253,11 +241,9 @@ with tab2:
         st.success(f"🤖 **AI Optimal Strategy**")
         st.metric("Optimal Influencer Count", f"{best_n}")
         st.metric("Expected Revenue", f"₹{best_rev:,.0f}", delta=f"₹{best_rev-manual_rev:,.0f}")
-        
-        # Added ROAS Difference here
         st.metric("Expected ROAS", f"{ai_roas:.2f}x", delta=f"{ai_roas-manual_roas:.2f}x")
         
-        # LIST ALLOCATION - FILTER REMOVED so all show up
+        # LIST ALLOCATION (FIXED: Shows all > 0)
         alloc_list = [{"Influencer": k, "Allocated Budget": f"₹{v:,.0f}"} for k,v in best_allocation.items() if v > 1.0]
         st.table(pd.DataFrame(alloc_list))
 
@@ -270,24 +256,23 @@ with tab2:
 
     st.divider()
 
-    # 4. BUDGET SIMULATOR (FIXED MATH & VISIBILITY)
+    # 4. BUDGET SIMULATOR
     st.subheader("Budget Simulator Curve")
-    st.caption("See how Diminishing Returns kick in as you scale.")
+    st.caption("Revenue projection as budget scales (AI vs Manual)")
     
     # Generate Data (0 to 3x budget)
     steps = 40
-    x_vals = np.linspace(50000, budget * 3, steps)
+    x_vals = np.linspace(100000, budget * 3, steps)
     y_ai = []
     y_man = []
     
     for x in x_vals:
-        # AI Logic (Re-optimize for X budget)
-        # Note: We re-run the full optimizer to find the best split for that specific budget
+        # AI Logic
         alloc = maximize_revenue(x, candidate_pool[:best_n], curve_params)
         rev_s = sum([response_function(amt, *curve_params[i]) for i, amt in alloc.items()])
         y_ai.append(rev_s)
         
-        # Manual Logic (Fixed N)
+        # Manual Logic
         per_bud = x / manual_n
         rev_m = sum([response_function(per_bud, *curve_params[i]) for i in manual_candidates])
         y_man.append(rev_m)
@@ -297,20 +282,49 @@ with tab2:
         "Manual Equal Split": y_man
     }, index=x_vals)
     
-    # NATIVE CHART ( Guaranteed to work )
     st.line_chart(chart_df)
     
-    # SLIDER INTERACTION
-    sim_budget = st.slider("👇 Drag to Check Revenue at Specific Budget", 50000, int(budget*3), int(budget), step=50000)
+    # Slider Interaction
+    sim_budget = st.slider("👇 Drag to Check Revenue at Specific Budget", 100000, int(budget*3), int(budget), step=50000)
     
     # Single Point Calculation
     sim_alloc = maximize_revenue(sim_budget, candidate_pool[:best_n], curve_params)
     sim_rev_ai = sum([response_function(amt, *curve_params[i]) for i, amt in sim_alloc.items()])
     
-    # Manual at Sim
     sim_per_bud = sim_budget / manual_n
     sim_rev_man = sum([response_function(sim_per_bud, *curve_params[i]) for i in manual_candidates])
     
     c_s1, c_s2 = st.columns(2)
     c_s1.info(f"AI at ₹{sim_budget:,.0f}: **₹{sim_rev_ai:,.0f}** Revenue")
     c_s2.warning(f"Manual at ₹{sim_budget:,.0f}: **₹{sim_rev_man:,.0f}** Revenue")
+
+    st.divider()
+
+    # ============================================================
+    #      NEW SECTION: MANUAL STRATEGY ANALYSIS (ADDED HERE)
+    # ============================================================
+    st.subheader("Manual Strategy Analysis: Effect of Portfolio Size")
+    st.caption("How ROAS changes as you manually add more influencers (splitting budget equally).")
+
+    # Generate Data: ROAS vs N (Number of Influencers)
+    # We iterate from 1 to 20 influencers (or max available)
+    max_test_n = min(20, len(candidate_pool))
+    n_values = range(1, max_test_n + 1)
+    roas_values = []
+
+    for n in n_values:
+        # Calculate ROAS if we split Current Budget equally among top N
+        current_candidates = candidate_pool[:n]
+        budget_per_inf = budget / n
+        
+        total_rev_n = sum([response_function(budget_per_inf, *curve_params[i]) for i in current_candidates])
+        roas_n = total_rev_n / budget
+        roas_values.append(roas_n)
+
+    # Plot
+    roas_df = pd.DataFrame({
+        "Manual ROAS": roas_values
+    }, index=n_values)
+
+    st.line_chart(roas_df)
+    st.info("This graph helps you find the 'Sweet Spot' for manual selection. Notice how ROAS peaks and then drops as you dilute the budget too much.")
