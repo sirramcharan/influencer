@@ -1,502 +1,359 @@
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 import altair as alt
+from scipy.optimize import curve_fit
 
 # ============================================================
-#                 HELPER: RESPONSE CURVE
+#                   CONFIG & HELPER FUNCTIONS
 # ============================================================
 
-def spend_to_revenue(spend_array, k, alpha, beta):
-    """
-    Non-linear response curve for influencer revenue.
-    revenue = k * (scaled_spend^alpha) * exp(-beta * scaled_spend),
-    scaled_spend = spend / 1e6.
-    """
-    spend_array = np.array(spend_array, dtype=float)
-    spend_scaled = spend_array / 1_000_000.0
-    base = k * (spend_scaled ** alpha) * np.exp(-beta * spend_scaled)
-    base = np.maximum(0.0, base)
-    return base * 1_000_000.0
+st.set_page_config(page_title="Influencer ROI Optimizer", layout="wide")
 
-
-# ============================================================
-#                        LOAD DATA
-# ============================================================
+# Custom CSS for "Metric Card" styling
+st.markdown("""
+<style>
+    div[data-testid="metric-container"] {
+        background-color: #f0f2f6;
+        border: 1px solid #e6e9ef;
+        padding: 5% 5% 5% 10%;
+        border-radius: 5px;
+        color: rgb(30, 30, 30);
+        overflow-wrap: break-word;
+    }
+    /* Break long metric labels */
+    div[data-testid="metric-container"] > label {
+        font-size: 1rem;
+        color: rgb(49, 51, 63);
+    }
+    div[data-testid="metric-container"] > div {
+        font-size: 1.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 @st.cache_data
-def load_data(path="influencer_roi.csv"):
-    df = pd.read_csv(path)
-    df["roas"] = df["roas"].clip(lower=0)
-    if {
-        "avg_likes_per_post",
-        "avg_comments_per_post",
-        "followers_start",
-    }.issubset(df.columns):
-        df["engagement_rate_est"] = (
-            (df["avg_likes_per_post"] + df["avg_comments_per_post"])
-            / df["followers_start"].replace(0, np.nan)
-        )
-    else:
-        df["engagement_rate_est"] = np.nan
-    return df
+def load_data():
+    """
+    Load the dataset. 
+    In a real app, you might connect to a database or cloud storage.
+    Here we expect 'influencer_dataset.csv' in the same folder.
+    """
+    try:
+        df = pd.read_csv("influencer_dataset.csv")
+        
+        # Ensure date column is datetime
+        if 'Date_Posted' in df.columns:
+            df['Date_Posted'] = pd.to_datetime(df['Date_Posted'])
+            
+        # Calculate derived metrics if they don't exist
+        if 'ROAS' not in df.columns and 'Total_Revenue_INR' in df.columns and 'Cost_Fee_INR' in df.columns:
+            df['ROAS'] = df['Total_Revenue_INR'] / df['Cost_Fee_INR']
+            
+        if 'Engagement_Rate' not in df.columns and 'Impressions' in df.columns:
+            # Avoid division by zero
+            df['Engagement_Rate'] = (
+                (df['Likes'] + df['Comments'] + df['Shares']) / df['Impressions'].replace(0, np.nan)
+            ).fillna(0)
 
+        return df
+    except FileNotFoundError:
+        return None
 
-st.set_page_config(page_title="Influencer ROI Analytics", layout="wide")
+# Non-linear response curve function: Revenue = k * (Spend^alpha) * exp(-beta * Spend)
+# Normalized Spend (Spend / 1M) is used to keep numbers stable for optimization
+def response_curve(spend, k, alpha, beta):
+    spend_norm = spend / 1_000_000 # Normalize to Millions
+    # Prevent negative or complex results
+    return np.maximum(0, k * (spend_norm ** alpha) * np.exp(-beta * spend_norm))
+
+@st.cache_data
+def fit_curves(df):
+    """
+    Fit a response curve for every influencer in the dataset.
+    Returns a dictionary of parameters {influencer_id: (k, alpha, beta)}
+    """
+    curve_params = {}
+    
+    # We need enough data points per influencer to fit a curve.
+    # If not enough, we use a "Category Average" fallback.
+    
+    # Group by Influencer
+    grouped = df.groupby('Influencer_ID')
+    
+    for influencer, group in grouped:
+        # We need at least 3 points to fit 3 parameters. 
+        # But for robustness, let's say 5. 
+        # If synthetic data is small, we might need to relax this or use synthetic points.
+        
+        if len(group) < 3:
+            # Fallback: Use generic parameters based on their Tier if possible, 
+            # or just generic defaults.
+            # (k, alpha, beta)
+            curve_params[influencer] = (1000000, 0.8, 0.1) 
+            continue
+            
+        X = group['Cost_Fee_INR'].values
+        y = group['Total_Revenue_INR'].values
+        
+        # Bounds: k>0, 0<alpha<2 (diminishing returns), beta>=0 (saturation)
+        try:
+            popt, _ = curve_fit(
+                response_curve, 
+                X, 
+                y, 
+                p0=[500000, 0.9, 0.05], # Initial guess
+                bounds=([1000, 0.1, 0.0], [np.inf, 2.0, 5.0]),
+                maxfev=5000
+            )
+            curve_params[influencer] = popt
+        except:
+             # Fallback if fit fails
+            curve_params[influencer] = (1000000, 0.8, 0.1)
+            
+    return curve_params
+
+# ============================================================
+#                   MAIN APP LOGIC
+# ============================================================
+
 df = load_data()
 
-st.title("Influencer ROI Analytics")
+if df is None:
+    st.error("Dataset 'influencer_dataset.csv' not found. Please upload it to your GitHub repo.")
+    st.stop()
+
+# --- SIDEBAR NAVIGATION ---
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to", ["📊 Dashboard", "🧠 Planner"])
 
 # ============================================================
-#                 DATA SOURCE (SIDEBAR)
+#                   PAGE 1: DASHBOARD
 # ============================================================
-
-source = st.sidebar.radio(
-    "Data source",
-    ["Use sample dataset", "Upload my campaign CSV"],
-)
-
-if source == "Upload my campaign CSV":
-    uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"])
-    if uploaded is not None:
-        df_user = pd.read_csv(uploaded)
-        st.success(f"Loaded {len(df_user)} rows from your file.")
-        df = df_user
-
-if "engagement_rate_est" not in df.columns and {
-    "avg_likes_per_post",
-    "avg_comments_per_post",
-    "followers_start",
-}.issubset(df.columns):
-    df["engagement_rate_est"] = (
-        (df["avg_likes_per_post"] + df["avg_comments_per_post"])
-        / df["followers_start"].replace(0, np.nan)
-    )
-
-# ============================================================
-#                 MODE TOGGLE (DASHBOARD / PLANNER)
-# ============================================================
-
-mode = st.segmented_control(
-    "View",
-    options=["Dashboard", "Planner"],
-    default="Dashboard",
-)
-
-# ============================================================
-#                         DASHBOARD
-# ============================================================
-
-if mode == "Dashboard":
-    st.subheader("Overview dashboard")
-
-    total_campaigns = len(df)
-    unique_influencers = df["influencer_id"].nunique() if "influencer_id" in df.columns else np.nan
-    unique_brands = df["brand_name"].nunique() if "brand_name" in df.columns else np.nan
-    avg_roas = df["roas"].replace([np.inf, -np.inf], np.nan).mean()
-    avg_eng_rate = df["engagement_rate_est"].replace([np.inf, -np.inf], np.nan).mean()
-
-    kpi1, kpi2, kpi3 = st.columns(3)
-    kpi1.metric("Total campaigns", f"{total_campaigns:,}")
-    if not np.isnan(unique_influencers):
-        kpi2.metric("Unique influencers", f"{unique_influencers:,}")
-    else:
-        kpi2.metric("Unique influencers", "N/A")
-    if not np.isnan(unique_brands):
-        kpi3.metric("Unique brands", f"{unique_brands:,}")
-    else:
-        kpi3.metric("Average ROAS", f"{avg_roas:.2f}x")
-
-    kpi4, kpi5 = st.columns(2)
-    kpi4.metric("Average ROAS", f"{avg_roas:.2f}x")
-    kpi5.metric("Avg est. engagement rate", f"{avg_eng_rate*100:.2f}%")
-
-    st.markdown("### Engagement and ROAS by platform")
-
-    if "platform" in df.columns:
-        plat_group = (
-            df.groupby("platform")
-            .agg(
-                avg_eng_rate=("engagement_rate_est", "mean"),
-                avg_roas=("roas", "mean"),
-                campaigns=("campaign_id", "count"),
-            )
-            .reset_index()
-        )
-
-        eng_chart = (
-            alt.Chart(plat_group)
-            .mark_bar()
-            .encode(
-                x=alt.X("platform:N", title="Platform"),
-                y=alt.Y(
-                    "avg_eng_rate:Q",
-                    title="Avg engagement rate",
-                    axis=alt.Axis(format="%"),
-                ),
-                tooltip=["platform", "avg_eng_rate", "campaigns"],
-                color="platform:N",
-            )
-        )
-
-        roas_chart = (
-            alt.Chart(plat_group)
-            .mark_bar()
-            .encode(
-                x=alt.X("platform:N", title="Platform"),
-                y=alt.Y("avg_roas:Q", title="Avg ROAS (x)"),
-                tooltip=["platform", "avg_roas", "campaigns"],
-                color="platform:N",
-            )
-        )
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.altair_chart(eng_chart, use_container_width=True)
-        with c2:
-            st.altair_chart(roas_chart, use_container_width=True)
-    else:
-        st.info("Platform column not found in data; cannot show platform breakdown.")
-
-    st.markdown("### Top performers (per influencer)")
-
-    if {"influencer_id", "influencer_handle"}.issubset(df.columns):
-        inf_agg = (
-            df.groupby(["influencer_id", "influencer_handle", "influencer_tier"])
-            .agg(
-                mean_roas=("roas", "mean"),
-                mean_eng_rate=("engagement_rate_est", "mean"),
-                campaigns=("campaign_id", "count"),
-            )
-            .reset_index()
-        )
-
-        top_roas = inf_agg.sort_values("mean_roas", ascending=False).head(10)
-        top_eng = inf_agg.sort_values("mean_eng_rate", ascending=False).head(10)
-
-        c3, c4 = st.columns(2)
-        with c3:
-            st.write("Top 10 influencers by average ROAS")
-            st.dataframe(
-                top_roas[
-                    ["influencer_handle", "influencer_tier", "mean_roas", "campaigns"]
-                ]
-                .rename(
-                    columns={
-                        "influencer_handle": "Influencer",
-                        "influencer_tier": "Tier",
-                        "mean_roas": "Mean ROAS",
-                        "campaigns": "Campaigns",
-                    }
-                )
-                .style.format({"Mean ROAS": "{:.2f}"})
-            )
-        with c4:
-            st.write("Top 10 influencers by average engagement rate")
-            st.dataframe(
-                top_eng[
-                    ["influencer_handle", "influencer_tier", "mean_eng_rate", "campaigns"]
-                ]
-                .rename(
-                    columns={
-                        "influencer_handle": "Influencer",
-                        "influencer_tier": "Tier",
-                        "mean_eng_rate": "Mean engagement rate",
-                        "campaigns": "Campaigns",
-                    }
-                )
-                .style.format({"Mean engagement rate": "{:.2%}"})
-            )
-    else:
-        st.info("Influencer columns not found; cannot show top performers.")
-
-    st.markdown("### ROAS distribution")
-    roas_clean = df["roas"].replace([np.inf, -np.inf], np.nan).dropna()
-    if len(roas_clean) > 0:
-        roas_df = pd.DataFrame({"roas": roas_clean})
-        roas_chart = (
-            alt.Chart(roas_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("roas:Q", bin=alt.Bin(maxbins=30), title="ROAS (x)"),
-                y=alt.Y("count():Q", title="Number of campaigns"),
-            )
-        )
-        st.altair_chart(roas_chart, use_container_width=True)
-    else:
-        st.info("No valid ROAS values to plot.")
-
-# ============================================================
-#                         PLANNER
-# ============================================================
-
-else:
-    st.subheader("Budget planner")
-
+if page == "📊 Dashboard":
+    st.title("Historical Campaign Performance")
+    
+    # --- Top Level KPIs ---
+    total_spend = df['Cost_Fee_INR'].sum()
+    total_rev = df['Total_Revenue_INR'].sum()
+    blended_roas = total_rev / total_spend if total_spend > 0 else 0
+    total_impressions = df['Impressions'].sum()
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Spend", f"₹{total_spend:,.0f}")
+    c2.metric("Total Revenue", f"₹{total_rev:,.0f}")
+    c3.metric("Blended ROAS", f"{blended_roas:.2f}x", delta_color="normal")
+    c4.metric("Total Impressions", f"{total_impressions:,.0f}")
+    
+    st.markdown("---")
+    
+    # --- Charts Row 1 ---
     col1, col2 = st.columns(2)
+    
     with col1:
-        category = st.selectbox(
-            "Select brand category",
-            sorted(df["brand_category"].dropna().unique()),
-        )
+        st.subheader("Spend vs Revenue Trend")
+        # Aggregating by Month
+        df['Month'] = df['Date_Posted'].dt.to_period('M').astype(str)
+        monthly_data = df.groupby('Month')[['Cost_Fee_INR', 'Total_Revenue_INR']].sum().reset_index()
+        
+        # Melt for Altair
+        monthly_melt = monthly_data.melt('Month', var_name='Metric', value_name='Amount')
+        
+        chart = alt.Chart(monthly_melt).mark_line(point=True).encode(
+            x='Month',
+            y='Amount',
+            color='Metric',
+            tooltip=['Month', 'Metric', 'Amount']
+        ).interactive()
+        st.altair_chart(chart, use_container_width=True)
+        
     with col2:
-        platform = st.selectbox(
-            "Select platform",
-            ["All"] + sorted(df["platform"].dropna().unique()),
+        st.subheader("ROAS by Platform")
+        plat_metrics = df.groupby('Platform').agg(
+            Spend=('Cost_Fee_INR', 'sum'),
+            Revenue=('Total_Revenue_INR', 'sum')
+        ).reset_index()
+        plat_metrics['ROAS'] = plat_metrics['Revenue'] / plat_metrics['Spend']
+        
+        bar_chart = alt.Chart(plat_metrics).mark_bar().encode(
+            x=alt.X('ROAS', title='ROAS (x)'),
+            y=alt.Y('Platform', sort='-x'),
+            color=alt.Color('ROAS', scale=alt.Scale(scheme='greens')),
+            tooltip=['Platform', 'ROAS', 'Spend', 'Revenue']
+        ).interactive()
+        st.altair_chart(bar_chart, use_container_width=True)
+        
+    # --- Leaderboard ---
+    st.subheader("Top Performing Influencers")
+    
+    # Group by Influencer to get averages/sums
+    leaderboard = df.groupby(['Influencer_ID', 'Influencer_Tier']).agg(
+        Total_Spend=('Cost_Fee_INR', 'sum'),
+        Total_Revenue=('Total_Revenue_INR', 'sum'),
+        Avg_ROAS=('ROAS', 'mean'),
+        Campaign_Count=('Campaign_ID', 'count')
+    ).reset_index()
+    
+    # Filter out one-off wonders (optional: keep only those with >1 campaign if data allows)
+    # leaderboard = leaderboard[leaderboard['Campaign_Count'] > 1]
+    
+    top_n = leaderboard.sort_values('Avg_ROAS', ascending=False).head(10)
+    
+    st.dataframe(
+        top_n.style.format({
+            "Total_Spend": "₹{:,.0f}", 
+            "Total_Revenue": "₹{:,.0f}", 
+            "Avg_ROAS": "{:.2f}x"
+        }),
+        use_container_width=True
+    )
+
+# ============================================================
+#                   PAGE 2: PLANNER
+# ============================================================
+elif page == "🧠 Planner":
+    st.title("Budget Optimization Engine")
+    
+    st.markdown("""
+    > **How this works:** This tool uses non-linear regression (diminishing returns) to calculate the 
+    > optimal way to split your budget. It compares putting all eggs in one basket (Single Strategy) 
+    > vs. diversifying across a portfolio (Combinatorial Strategy).
+    """)
+    
+    # --- 1. Inputs ---
+    with st.sidebar:
+        st.header("Campaign Settings")
+        budget = st.number_input("Total Budget (₹)", min_value=10000, max_value=5000000, value=500000, step=10000)
+        
+        platform_filter = st.multiselect(
+            "Filter Platforms", 
+            options=df['Platform'].unique(),
+            default=df['Platform'].unique()
         )
-
-    filtered = df[df["brand_category"] == category].copy()
-    if platform != "All":
-        filtered = filtered[filtered["platform"] == platform]
-
-    if filtered.empty:
-        st.warning("No data for this combination. Try another category/platform.")
+        
+        tier_filter = st.multiselect(
+            "Filter Tiers",
+            options=df['Influencer_Tier'].unique(),
+            default=df['Influencer_Tier'].unique()
+        )
+    
+    # --- 2. Filter Data & Fit Curves ---
+    filtered_df = df[
+        (df['Platform'].isin(platform_filter)) & 
+        (df['Influencer_Tier'].isin(tier_filter))
+    ]
+    
+    if filtered_df.empty:
+        st.warning("No data matches your filters. Please adjust.")
         st.stop()
-
-    # Influencer summary
-    inf_summary = (
-        filtered.groupby(["influencer_id", "influencer_handle", "influencer_tier"])
-        .agg(
-            mean_roas=("roas", "mean"),
-            mean_cpa=("cpa", "mean"),
-            mean_total_spend=("total_spend", "mean"),
-            mean_revenue=("revenue", "mean"),
-        )
-        .reset_index()
+        
+    curve_params = fit_curves(filtered_df)
+    
+    # --- 3. Optimization Logic ---
+    
+    # Calculate Expected Revenue for EVERY influencer at full budget
+    influencer_scores = []
+    
+    for inf_id, params in curve_params.items():
+        k, alpha, beta = params
+        expected_rev = response_curve(budget, k, alpha, beta)
+        
+        # Get metadata for display
+        meta = filtered_df[filtered_df['Influencer_ID'] == inf_id].iloc[0]
+        
+        influencer_scores.append({
+            "Influencer_ID": inf_id,
+            "Tier": meta['Influencer_Tier'],
+            "Platform": meta['Platform'],
+            "Params": params,
+            "Expected_Rev_Full_Budget": expected_rev
+        })
+        
+    scores_df = pd.DataFrame(influencer_scores)
+    
+    # STRATEGY A: BEST SINGLE
+    best_single = scores_df.sort_values('Expected_Rev_Full_Budget', ascending=False).iloc[0]
+    rev_single = best_single['Expected_Rev_Full_Budget']
+    roas_single = rev_single / budget
+    
+    # STRATEGY B: TOP 3 COMBO (Simple Equal Split Heuristic)
+    # In a full thesis, you'd use scipy.optimize.minimize to find exact split.
+    # Here we simulate an equal split for robustness.
+    
+    split_budget = budget / 3
+    
+    # Recalculate revenue for everyone at 1/3 budget
+    scores_df['Expected_Rev_Split'] = scores_df['Params'].apply(
+        lambda p: response_curve(split_budget, p[0], p[1], p[2])
     )
+    
+    top_3_combo = scores_df.sort_values('Expected_Rev_Split', ascending=False).head(3)
+    rev_combo = top_3_combo['Expected_Rev_Split'].sum()
+    roas_combo = rev_combo / budget
+    
+    # --- 4. Display Results ---
+    
+    col_a, col_b = st.columns(2)
+    
+    # Card A
+    with col_a:
+        st.subheader("Strategy A: Concentrated")
+        st.caption("Invest 100% in Top Performer")
+        st.metric("Expected Revenue", f"₹{rev_single:,.0f}")
+        st.metric("Expected ROAS", f"{roas_single:.2f}x", delta_color="off")
+        st.write(f"**Influencer:** {best_single['Influencer_ID']} ({best_single['Tier']})")
+        
+    # Card B
+    with col_b:
+        st.subheader("Strategy B: Diversified (Top 3)")
+        st.caption("Split Budget Equally (33% each)")
+        st.metric("Expected Revenue", f"₹{rev_combo:,.0f}")
+        
+        # Highlight the winner
+        delta_val = roas_combo - roas_single
+        st.metric("Expected ROAS", f"{roas_combo:.2f}x", delta=f"{delta_val:.2f}x vs Single")
+        
+        st.write("**Portfolio:**")
+        for _, row in top_3_combo.iterrows():
+            st.write(f"- {row['Influencer_ID']} ({row['Tier']})")
 
-    # Curve parameters
-    if {"curve_k", "curve_alpha", "curve_beta"}.issubset(filtered.columns):
-        curve_params = (
-            filtered.groupby("influencer_id")
-            .agg(
-                k=("curve_k", "median"),
-                alpha=("curve_alpha", "median"),
-                beta=("curve_beta", "median"),
-            )
-            .reset_index()
-        )
-        inf_summary = inf_summary.merge(curve_params, on="influencer_id", how="left")
-    else:
-        inf_summary["k"] = 0.0
-        inf_summary["alpha"] = 1.0
-        inf_summary["beta"] = 0.0
-
-    inf_summary[["k", "alpha", "beta"]] = inf_summary[["k", "alpha", "beta"]].fillna(0.0)
-    inf_summary["mean_roas"] = inf_summary["mean_roas"].fillna(0)
-    inf_summary["mean_cpa"] = (
-        inf_summary["mean_cpa"].replace([np.inf, -np.inf], np.nan).fillna(0)
-    )
-
-    # Budget inputs
-    min_budget = max(10_000, int(filtered["total_spend"].quantile(0.1)))
-    max_budget_default = int(filtered["total_spend"].quantile(0.9) * 5)
-
-    col_b1, col_b2 = st.columns(2)
-    with col_b1:
-        budget = st.number_input(
-            "Enter your total campaign budget (₹)",
-            min_value=float(min_budget),
-            value=float((min_budget + max_budget_default) / 2),
-            step=10_000.0,
-            format="%.0f",
-        )
-    with col_b2:
-        graph_max_budget = st.slider(
-            "Max budget shown on graph (x-axis)",
-            min_value=min_budget,
-            max_value=max_budget_default,
-            value=max_budget_default,
-            step=10_000,
-            format="₹ %d",
-        )
-
-    st.markdown("#### Recommended influencers for this budget")
-
-    top_n = st.slider("Max number of influencers in combo", 1, 5, 3)
-
-    def expected_rev_for_row(row, spend):
-        return float(spend_to_revenue(spend, row["k"], row["alpha"], row["beta"]))
-
-    inf_summary["expected_revenue_at_budget"] = inf_summary.apply(
-        lambda r: expected_rev_for_row(r, budget), axis=1
-    )
-    inf_summary["expected_roas_at_budget"] = (
-        inf_summary["expected_revenue_at_budget"] / budget if budget > 0 else 0.0
-    )
-
-    ranked = inf_summary.sort_values(
-        "expected_revenue_at_budget", ascending=False
-    ).reset_index(drop=True)
-
-    best_single = ranked.iloc[0]
-    single_rev = best_single["expected_revenue_at_budget"]
-    single_roas = best_single["expected_roas_at_budget"]
-
-    # Combo logic
-    if top_n == 1:
-        # Combo == best single
-        combo = ranked.head(1).copy()
-        combo["allocated_budget"] = budget
-        combo["expected_revenue"] = combo["expected_revenue_at_budget"]
-        total_combo_rev = single_rev
-        combo_roas = single_roas
-    else:
-        combo = ranked.head(top_n).copy()
-        combo["allocated_budget"] = budget / top_n
-        combo["expected_revenue"] = combo.apply(
-            lambda r: expected_rev_for_row(r, r["allocated_budget"]), axis=1
-        )
-        total_combo_rev = combo["expected_revenue"].sum()
-        combo_roas = total_combo_rev / budget if budget > 0 else 0
-
-    colA, colB = st.columns(2)
-
-    with colA:
-        st.markdown("**Best single influencer (by expected revenue at this budget)**")
-        st.write(
-            f"{best_single['influencer_handle']} ({best_single['influencer_tier']}), "
-            f"expected ROAS ≈ {single_roas:.2f}x"
-        )
-        st.write(f"Budget: ₹{budget:,.0f} → Expected revenue ≈ ₹{single_rev:,.0f}")
-
-    with colB:
-        st.markdown(f"**Best {top_n}-influencer combination (equal split)**")
-        st.dataframe(
-            combo[
-                [
-                    "influencer_handle",
-                    "influencer_tier",
-                    "expected_roas_at_budget",
-                    "allocated_budget",
-                    "expected_revenue",
-                ]
-            ]
-            .rename(
-                columns={
-                    "influencer_handle": "Influencer",
-                    "influencer_tier": "Tier",
-                    "expected_roas_at_budget": "ROAS at allocated budget",
-                    "allocated_budget": "Budget (₹)",
-                    "expected_revenue": "Expected revenue (₹)",
-                }
-            )
-            .style.format(
-                {
-                    "ROAS at allocated budget": "{:.2f}",
-                    "Budget (₹)": "₹{:.0f}",
-                    "Expected revenue (₹)": "₹{:.0f}",
-                }
-            )
-        )
-        st.write(
-            f"Total combo expected revenue ≈ ₹{total_combo_rev:,.0f} "
-            f"(ROAS ≈ {combo_roas:.2f}x)"
-        )
-
-    # ------------------ GRAPHS ------------------
-
-    st.markdown("### Budget vs expected revenue (non-linear curves)")
-
-    budgets = np.linspace(min_budget, graph_max_budget, 40)
-
-    # Best single curve
-    single_curve = spend_to_revenue(
-        budgets, best_single["k"], best_single["alpha"], best_single["beta"]
-    )
-
-    # Combo curve: sum each influencer's curve at its share of budget
-    if top_n == 1:
-        combo_curve = single_curve.copy()
-    else:
-        combo_curve = np.zeros_like(budgets, dtype=float)
-        for _, row in combo.iterrows():
-            share = 1.0 / top_n
-            combo_curve += spend_to_revenue(
-                budgets * share, row["k"], row["alpha"], row["beta"]
-            )
-
-    plot_df = pd.DataFrame(
-        {
-            "budget": budgets.astype(float),
-            "Best single": single_curve.astype(float),
-            f"Top {top_n} combo": combo_curve.astype(float),
-        }
-    )
-    long_rev = plot_df.melt(id_vars="budget", var_name="Scenario", value_name="revenue")
-
-    rev_chart = (
-        alt.Chart(long_rev)
-        .mark_line()
-        .encode(
-            x=alt.X("budget:Q", title="Budget (₹)"),
-            y=alt.Y("revenue:Q", title="Expected revenue (₹)"),
-            color=alt.Color("Scenario:N", title="Scenario"),
-            tooltip=["budget", "Scenario", "revenue"],
-        )
-        .interactive()
-    )
-    st.altair_chart(rev_chart, use_container_width=True)
-
-    # ROAS vs budget
-    st.markdown("### Budget vs expected ROAS")
-
-    roas_single = single_curve / budgets
-    roas_combo = combo_curve / budgets
-
-    roas_df = pd.DataFrame(
-        {
-            "budget": budgets.astype(float),
-            "Best single": roas_single.astype(float),
-            f"Top {top_n} combo": roas_combo.astype(float),
-        }
-    )
-    long_roas = roas_df.melt(id_vars="budget", var_name="Scenario", value_name="roas")
-
-    roas_chart = (
-        alt.Chart(long_roas)
-        .mark_line()
-        .encode(
-            x=alt.X("budget:Q", title="Budget (₹)"),
-            y=alt.Y("roas:Q", title="Expected ROAS (x)"),
-            color=alt.Color("Scenario:N", title="Scenario"),
-            tooltip=["budget", "Scenario", "roas"],
-        )
-        .interactive()
-    )
-    st.altair_chart(roas_chart, use_container_width=True)
-
-    # Marginal revenue vs budget (approx first derivative)
-    st.markdown("### Marginal revenue per extra ₹ (diminishing returns)")
-
-    marg_single = np.diff(single_curve) / np.diff(budgets)
-    marg_combo = np.diff(combo_curve) / np.diff(budgets)
-    mid_budgets = (budgets[:-1] + budgets[1:]) / 2
-
-    marg_df = pd.DataFrame(
-        {
-            "budget": mid_budgets.astype(float),
-            "Best single": marg_single.astype(float),
-            f"Top {top_n} combo": marg_combo.astype(float),
-        }
-    )
-    long_marg = marg_df.melt(id_vars="budget", var_name="Scenario", value_name="marginal")
-
-    marg_chart = (
-        alt.Chart(long_marg)
-        .mark_line()
-        .encode(
-            x=alt.X("budget:Q", title="Budget (₹)"),
-            y=alt.Y("marginal:Q", title="Marginal revenue per extra ₹"),
-            color=alt.Color("Scenario:N", title="Scenario"),
-            tooltip=["budget", "Scenario", "marginal"],
-        )
-        .interactive()
-    )
-    st.altair_chart(marg_chart, use_container_width=True)
-
-    st.caption(
-        "When Top 1 combo is selected, its curves are identical to the best single influencer. "
-        "For higher N, combo curves are the sum of each influencer's non-linear response, "
-        "so shapes can differ (e.g., more stable or less peaky)."
-    )
+    st.markdown("---")
+    
+    # --- 5. Visualization: The Diminishing Returns Curve ---
+    st.subheader("The 'Why': Diminishing Returns Analysis")
+    
+    # Generate curve points for plotting
+    x_points = np.linspace(0, budget * 1.5, 50) # Plot up to 1.5x budget to show future saturation
+    
+    # Single Curve
+    k, a, b = best_single['Params']
+    y_single = response_curve(x_points, k, a, b)
+    
+    # Combo Curve (Sum of top 3 curves at x/3 spend each)
+    y_combo = np.zeros_like(x_points)
+    for _, row in top_3_combo.iterrows():
+        kp, ap, bp = row['Params']
+        # We assume if total spend is X, each gets X/3
+        y_combo += response_curve(x_points/3, kp, ap, bp)
+        
+    plot_data = pd.DataFrame({
+        'Budget': np.tile(x_points, 2),
+        'Revenue': np.concatenate([y_single, y_combo]),
+        'Strategy': ['Best Single'] * 50 + ['Top 3 Combo'] * 50
+    })
+    
+    line_chart = alt.Chart(plot_data).mark_line().encode(
+        x=alt.X('Budget', axis=alt.Axis(format='₹~s')),
+        y=alt.Y('Revenue', axis=alt.Axis(format='₹~s')),
+        color='Strategy',
+        tooltip=['Strategy', 'Budget', 'Revenue']
+    ).properties(height=400).interactive()
+    
+    st.altair_chart(line_chart, use_container_width=True)
+    
+    st.info(f"""
+    **Analysis:**
+    - The **Blue Line** (Single) shows how revenue grows if you give everything to {best_single['Influencer_ID']}.
+    - The **Orange Line** (Combo) shows the revenue from splitting budget across 3 influencers.
+    - If the lines cross, that is your **Optimization Tipping Point**.
+    """)
