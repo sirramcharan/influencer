@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from scipy.optimize import curve_fit
+from scipy.optimize import minimize
 
 # ============================================================
 #                   CONFIG & STYLING
@@ -10,7 +10,6 @@ from scipy.optimize import curve_fit
 
 st.set_page_config(page_title="Algorithmic Marketer", layout="wide")
 
-# Custom CSS for clear visibility in both Light/Dark modes
 st.markdown("""
 <style>
     .metric-card {
@@ -23,7 +22,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================
-#                   DATA & MATH FUNCTIONS
+#                   MATH ENGINE
 # ============================================================
 
 @st.cache_data
@@ -48,16 +47,19 @@ def load_data(uploaded_file=None):
             
     return df
 
-def response_curve(spend, k, alpha, beta):
-    # Normalized spend to avoid math overflow (millions)
+def response_function(spend, k, alpha, beta):
+    """
+    Diminishing Returns Formula:
+    Revenue = k * (Spend^alpha) * e^(-beta * Spend)
+    """
+    # Scaling to prevent overflow
     x = spend / 1_000_000 
     return np.maximum(0, k * (x ** alpha) * np.exp(-beta * x))
 
 @st.cache_data
-def fit_curves(df):
+def fit_curves_heuristic(df):
     """
-    Fits a curve for every influencer.
-    Returns: Dict {id: (k, alpha, beta)}
+    Estimates curve parameters based on historical averages.
     """
     curve_params = {}
     grouped = df.groupby('Influencer_ID')
@@ -68,57 +70,49 @@ def fit_curves(df):
         avg_roas = group['ROAS'].mean()
         avg_cost = group['Cost_Fee_INR'].mean()
         
-        # Heuristic fitting logic for demo purposes
-        k_est = avg_cost * avg_roas * 1.5 
-        alpha_est = 0.85 + (avg_roas / 25.0) 
-        beta_est = 0.05 + (15000 / avg_cost) 
+        # Heuristic Logic:
+        # High ROAS = High Alpha (Viral Lift)
+        # High Cost = Low Beta (Slower Saturation, can take more money)
+        k_est = avg_cost * avg_roas * 1.2 
+        alpha_est = 0.8 + (np.log1p(avg_roas) / 10.0) 
+        beta_est = 0.02 + (5000 / avg_cost) 
         
         curve_params[inf_id] = (k_est, alpha_est, beta_est)
             
     return curve_params
 
-def optimize_budget(total_budget, influencers, curve_params):
+def maximize_revenue(budget, influencers, curve_params):
     """
-    Smart Allocation Algorithm:
-    Allocates budget in small steps to the influencer with the highest 
-    Marginal ROAS at that specific moment.
+    MATHEMATICAL OPTIMIZER (SLSQP)
+    Finds the exact split of 'budget' across 'influencers' to maximize Total Revenue.
     """
-    allocation = {inf: 0.0 for inf in influencers}
-    remaining_budget = total_budget
-    step_size = total_budget * 0.01  # 1% steps for precision
+    n = len(influencers)
+    params = [curve_params[i] for i in influencers]
     
-    # Pre-fetch params
-    params = {inf: curve_params[inf] for inf in influencers if inf in curve_params}
+    # Objective: Minimize negative revenue (maximize revenue)
+    def objective(allocations):
+        total_rev = 0
+        for i, spend in enumerate(allocations):
+            k, a, b = params[i]
+            total_rev += response_function(spend, k, a, b)
+        return -total_rev # Negative because we minimize
+
+    # Constraint: Sum of allocations must equal budget
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - budget})
     
-    while remaining_budget > step_size:
-        best_inf = None
-        best_marginal_gain = -1
-        
-        for inf, p in params.items():
-            k, a, b = p
-            current_spend = allocation[inf]
-            
-            # Calculate Marginal Revenue (Revenue of next step - Revenue now)
-            rev_now = response_curve(current_spend, k, a, b)
-            rev_next = response_curve(current_spend + step_size, k, a, b)
-            marginal_gain = rev_next - rev_now
-            
-            if marginal_gain > best_marginal_gain:
-                best_marginal_gain = marginal_gain
-                best_inf = inf
-        
-        # Stop if even the best option yields zero or negative return (Saturation)
-        if best_marginal_gain <= 0:
-            break
-            
-        if best_inf:
-            allocation[best_inf] += step_size
-            remaining_budget -= step_size
-            
+    # Bounds: Each allocation must be between 0 and budget
+    bounds = tuple((0, budget) for _ in range(n))
+    
+    # Initial Guess: Equal split
+    initial_guess = [budget/n] * n
+    
+    result = minimize(objective, initial_guess, method='SLSQP', bounds=bounds, constraints=constraints)
+    
+    allocation = {inf: round(amt, 2) for inf, amt in zip(influencers, result.x)}
     return allocation
 
 # ============================================================
-#                   MAIN APP UI
+#                   MAIN APP
 # ============================================================
 
 st.title("The Algorithmic Marketer")
@@ -134,17 +128,15 @@ df = load_data(uploaded_file)
 if df is None:
     st.warning("⚠️ No data found. Please upload 'influencer_dataset.csv'.")
     st.stop()
-else:
-    st.sidebar.success("Data Loaded Successfully")
 
 # --- TABS ---
-tab1, tab2 = st.tabs(["📊 Performance Overview", "🚀 Campaign Planner"])
+tab1, tab2 = st.tabs(["📊 Performance Dashboard", "🧠 AI Planner"])
 
 # ============================================================
 #                   TAB 1: DASHBOARD
 # ============================================================
 with tab1:
-    # --- ROW 1: KPIs ---
+    # Row 1: KPIs
     total_spend = df['Cost_Fee_INR'].sum()
     total_rev = df['Total_Revenue_INR'].sum()
     roas = total_rev / total_spend if total_spend > 0 else 0
@@ -158,162 +150,174 @@ with tab1:
     
     st.divider()
     
-    # --- ROW 2: CHARTS ---
+    # Row 2: Charts
     c1, c2 = st.columns(2)
-    
     with c1:
-        st.subheader("Revenue by Category")
-        cat_chart = alt.Chart(df).mark_bar().encode(
+        st.subheader("Efficiency by Category")
+        cat_agg = df.groupby('Category')[['Cost_Fee_INR', 'Total_Revenue_INR']].sum().reset_index()
+        cat_agg['ROAS'] = cat_agg['Total_Revenue_INR'] / cat_agg['Cost_Fee_INR']
+        
+        c = alt.Chart(cat_agg).mark_bar().encode(
             x=alt.X('Category', sort='-y'),
-            y='sum(Total_Revenue_INR)',
+            y='ROAS',
             color='Category',
-            tooltip=['Category', 'sum(Total_Revenue_INR)']
+            tooltip=['Category', 'ROAS']
         ).interactive()
-        st.altair_chart(cat_chart, use_container_width=True)
+        st.altair_chart(c, use_container_width=True)
         
     with c2:
-        st.subheader("Platform Efficiency (ROAS)")
-        plat_agg = df.groupby('Platform').agg(
-            Spend=('Cost_Fee_INR', 'sum'),
-            Revenue=('Total_Revenue_INR', 'sum')
-        ).reset_index()
-        plat_agg['ROAS'] = plat_agg['Revenue'] / plat_agg['Spend']
-        
-        roas_chart = alt.Chart(plat_agg).mark_bar().encode(
-            x=alt.X('ROAS', title='ROAS Multiplier'),
-            y=alt.Y('Platform', sort='-x'),
-            color=alt.Color('ROAS', scale=alt.Scale(scheme='greens')),
-            tooltip=['Platform', 'ROAS']
+        st.subheader("Spend vs Revenue Scatter")
+        s = alt.Chart(df).mark_circle(size=60).encode(
+            x='Cost_Fee_INR',
+            y='Total_Revenue_INR',
+            color='Platform',
+            tooltip=['Influencer_ID', 'Platform', 'ROAS']
         ).interactive()
-        st.altair_chart(roas_chart, use_container_width=True)
+        st.altair_chart(s, use_container_width=True)
 
 # ============================================================
 #                   TAB 2: PLANNER
 # ============================================================
 with tab2:
-    st.subheader("Smart Budget Allocator")
+    st.subheader("Budget Optimization Engine")
     
-    # INPUTS
-    col_in1, col_in2, col_in3 = st.columns(3)
-    with col_in1:
-        budget = st.number_input("Total Budget (₹)", 10000, 10000000, 500000, step=50000)
-    with col_in2:
-        cats = st.multiselect("Category", df['Category'].unique(), default=df['Category'].unique())
-    with col_in3:
-        plats = st.multiselect("Platform", df['Platform'].unique(), default=df['Platform'].unique())
+    # --- 1. FILTERS (Empty by default) ---
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        budget = st.number_input("Total Campaign Budget (₹)", 10000, 10000000, 500000, step=50000)
+    with col2:
+        cats = st.multiselect("Category Filter (Default: All)", df['Category'].unique())
+    with col3:
+        plats = st.multiselect("Platform Filter (Default: All)", df['Platform'].unique())
         
-    # FILTER LOGIC
-    filtered = df[df['Category'].isin(cats) & df['Platform'].isin(plats)]
+    # Apply Logic: If empty list, treat as "All"
+    filtered = df.copy()
+    if cats:
+        filtered = filtered[filtered['Category'].isin(cats)]
+    if plats:
+        filtered = filtered[filtered['Platform'].isin(plats)]
+        
     if filtered.empty:
-        st.error("No influencers match filters.")
+        st.error("No data found for these filters.")
         st.stop()
         
-    curve_params = fit_curves(filtered)
+    # --- 2. CALCULATIONS ---
+    # Fit curves
+    curve_params = fit_curves_heuristic(filtered)
     
-    # 1. AI OPTIMAL ALLOCATION
-    # Get top 20 candidates (filtering pool size for speed)
-    top_candidates = filtered.groupby('Influencer_ID')['Total_Revenue_INR'].mean().nlargest(20).index.tolist()
+    # Pick Top Candidates (Pool of best performers to optimize within)
+    # We take top 15 by historical mean revenue to limit computation time
+    candidate_pool = filtered.groupby('Influencer_ID')['Total_Revenue_INR'].mean().nlargest(15).index.tolist()
     
-    # Run Optimizer
-    smart_allocation = optimize_budget(budget, top_candidates, curve_params)
+    # A. RUN OPTIMIZER (AI)
+    ai_allocation = maximize_revenue(budget, candidate_pool, curve_params)
     
-    # Parse Results
-    opt_revenue = 0
-    active_influencers = 0
-    utilized_budget = 0
-    
-    alloc_data = []
-    
-    for inf, amt in smart_allocation.items():
-        if amt > 100: # Filter out negligible amounts
+    ai_rev = 0
+    ai_spend = 0
+    ai_data = []
+    for inf, amt in ai_allocation.items():
+        if amt > 1000: # Only count significant allocations
             k, a, b = curve_params[inf]
-            rev = response_curve(amt, k, a, b)
-            opt_revenue += rev
-            active_influencers += 1
-            utilized_budget += amt
-            alloc_data.append({"Influencer": inf, "Allocated Budget": amt, "Expected Revenue": rev})
+            rev = response_function(amt, k, a, b)
+            ai_rev += rev
+            ai_spend += amt
+            ai_data.append({"Influencer": inf, "Budget": amt, "Revenue": rev})
             
-    opt_roas = opt_revenue / utilized_budget if utilized_budget > 0 else 0
+    ai_roas = ai_rev / ai_spend if ai_spend > 0 else 0
     
-    # 2. MANUAL SELECTION (Comparison)
-    user_n = st.slider("Select Manual Count (for comparison)", 1, 10, 5)
-    manual_candidates = top_candidates[:user_n]
-    manual_budget_per = budget / user_n
-    manual_revenue = 0
+    # B. RUN MANUAL (Equal Split Top 5)
+    manual_n = 5
+    manual_candidates = candidate_pool[:manual_n]
+    manual_budget_per = budget / manual_n
+    manual_rev = 0
     
     for inf in manual_candidates:
         k, a, b = curve_params[inf]
-        manual_revenue += response_curve(manual_budget_per, k, a, b)
+        manual_rev += response_function(manual_budget_per, k, a, b)
         
-    manual_roas = manual_revenue / budget
+    manual_roas = manual_rev / budget
     
+    # --- 3. RESULTS DISPLAY ---
     st.divider()
     
-    # --- RESULTS DISPLAY ---
     col_res1, col_res2 = st.columns(2)
     
     with col_res1:
-        st.success("🤖 **AI Smart Allocation**")
-        
-        # NEW: Optimal Count & Budget Metrics
+        st.success("🤖 **AI Optimal Strategy**")
         m1, m2 = st.columns(2)
-        m1.metric("Optimal Influencers", f"{active_influencers}")
-        m2.metric("Budget Utilized", f"₹{utilized_budget:,.0f}")
+        m1.metric("Optimal Influencers", f"{len(ai_data)}")
+        m2.metric("Budget Utilized", f"₹{ai_spend:,.0f}")
         
         m3, m4 = st.columns(2)
-        m3.metric("Expected Revenue", f"₹{opt_revenue:,.0f}", delta=f"₹{opt_revenue-manual_revenue:,.0f}")
-        m4.metric("Expected ROAS", f"{opt_roas:.2f}x")
+        m3.metric("Expected Revenue", f"₹{ai_rev:,.0f}", delta=f"₹{ai_rev-manual_rev:,.0f}")
+        m4.metric("Expected ROAS", f"{ai_roas:.2f}x", delta=f"{ai_roas-manual_roas:.2f}x")
         
-        with st.expander("View Allocation Table"):
-             st.dataframe(pd.DataFrame(alloc_data).style.format({"Allocated Budget": "₹{:,.0f}", "Expected Revenue": "₹{:,.0f}"}))
+        # ALLOCATION CHART
+        st.write(" **Budget Allocation (AI)**")
+        ai_df = pd.DataFrame(ai_data)
+        if not ai_df.empty:
+            pie = alt.Chart(ai_df).mark_arc(innerRadius=60).encode(
+                theta='Budget',
+                color=alt.Color('Influencer', legend=None),
+                tooltip=['Influencer', 'Budget', 'Revenue']
+            ).properties(height=200)
+            st.altair_chart(pie, use_container_width=True)
 
     with col_res2:
-        st.warning(f"👤 **Manual Selection** (Top {user_n} Equally)")
-        st.metric("Influencers Selected", f"{user_n}")
-        st.metric("Budget Allocated", f"₹{budget:,.0f}")
-        st.metric("Expected Revenue", f"₹{manual_revenue:,.0f}")
-        st.metric("Expected ROAS", f"{manual_roas:.2f}x")
+        st.warning(f"👤 **Manual Strategy** (Top {manual_n} Equal Split)")
+        m1, m2 = st.columns(2)
+        m1.metric("Influencers", f"{manual_n}")
+        m2.metric("Budget Allocated", f"₹{budget:,.0f}")
+        
+        m3, m4 = st.columns(2)
+        m3.metric("Expected Revenue", f"₹{manual_rev:,.0f}")
+        m4.metric("Expected ROAS", f"{manual_roas:.2f}x")
+        
+        # COMPARISON CHART
+        st.write(" **Strategy Comparison**")
+        comp_data = pd.DataFrame({
+            'Strategy': ['AI Optimal', 'Manual'],
+            'Revenue': [ai_rev, manual_rev]
+        })
+        bar = alt.Chart(comp_data).mark_bar().encode(
+            x='Strategy',
+            y='Revenue',
+            color='Strategy'
+        ).properties(height=200)
+        st.altair_chart(bar, use_container_width=True)
 
     st.divider()
-    
-    # --- DIMINISHING RETURNS SIMULATOR ---
+
+    # --- 4. BUDGET SIMULATOR (Fixed Graph) ---
     st.subheader("Budget Simulator Curve")
-    st.caption("See how Revenue changes as you increase budget (Smart vs Manual)")
+    st.caption("Projected Revenue as Budget Scales (AI vs Manual)")
     
-    # Generate Data for Graph
-    # We create a range from 10% of budget to 200% of budget
-    x_points = np.linspace(budget * 0.1, budget * 2.5, 30)
+    # Calculate points
+    steps = 20
+    x_vals = np.linspace(budget * 0.2, budget * 2.5, steps)
     
-    y_smart = []
-    y_manual = []
+    y_ai = []
+    y_man = []
     
-    for x in x_points:
-        # Smart Curve
-        alloc = optimize_budget(x, top_candidates, curve_params)
-        rev_s = sum([response_curve(amt, *curve_params[i]) for i, amt in alloc.items()])
-        y_smart.append(rev_s)
+    for x in x_vals:
+        # AI Logic
+        alloc = maximize_revenue(x, candidate_pool, curve_params)
+        rev_s = sum([response_function(amt, *curve_params[i]) for i, amt in alloc.items()])
+        y_ai.append(rev_s)
         
-        # Manual Curve
-        per_bud = x / user_n
-        rev_m = sum([response_curve(per_bud, *curve_params[i]) for i in manual_candidates])
-        y_manual.append(rev_m)
-        
-    # Build DataFrame
-    chart_df = pd.DataFrame({
-        'Budget': np.concatenate([x_points, x_points]),
-        'Revenue': np.concatenate([y_smart, y_manual]),
-        'Strategy': ['AI Smart Allocation'] * 30 + [f'Manual (Top {user_n})'] * 30
-    })
+        # Manual Logic
+        per_bud = x / manual_n
+        rev_m = sum([response_function(per_bud, *curve_params[i]) for i in manual_candidates])
+        y_man.append(rev_m)
     
-    # Altair Chart
-    base_chart = alt.Chart(chart_df).mark_line(point=True).encode(
-        x=alt.X('Budget', axis=alt.Axis(format='₹~s', title='Total Budget Invested')),
-        y=alt.Y('Revenue', axis=alt.Axis(format='₹~s', title='Expected Revenue')),
-        color='Strategy',
-        tooltip=['Budget', 'Revenue', 'Strategy']
-    ).properties(height=400)
+    # Create simple dataframe for line_chart
+    chart_data = pd.DataFrame({
+        "Budget": x_vals,
+        "AI Optimal Revenue": y_ai,
+        "Manual Revenue": y_man
+    }).set_index("Budget")
     
-    # Current Budget Line
-    vline = alt.Chart(pd.DataFrame({'x': [budget]})).mark_rule(color='red', strokeDash=[5,5]).encode(x='x')
+    # Use standard Streamlit Line Chart (Robust)
+    st.line_chart(chart_data)
     
-    st.altair_chart(base_chart + vline, use_container_width=True)
+    st.info(f"The Red Line (Manual) assumes you keep splitting budget equally among 5 people. The Blue Line (AI) dynamically shifts money to the best performer at every budget level.")
