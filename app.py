@@ -97,7 +97,7 @@ def maximize_revenue(budget, influencers, curve_params):
 #                   MAIN APP UI
 # ============================================================
 
-st.title("The Algorithmic Marketer")
+st.title("The Marketing Scientist")
 
 # --- SIDEBAR ---
 with st.sidebar:
